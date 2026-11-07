@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 // sys.cjs 共享原语单测（M0 基线补充）
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -491,8 +491,12 @@ test('SYS-13 detectService 孪生 parity：同 mock 下 sync 与 async 结果逐
 test('SYS-14 desktop 形态：port-mode=desktop、port-pid=本进程，且不探测 3080（v3.4.x 契约）', async () => {
   // 桌面端 web 端口随机、无 nssm 服务概念：3080 探测会误判，必须整体跳过（holder=null）。
   sys.__setDesktop(true);
+  // 工具预检键走同文件平台契约（win `where sc.exe` / linux `which systemctl`）——
+  // CI run 42351521934 实证：硬编码 win 键在 linux 上 UNMOCKED → 预检早退全表
+  // tool-unreachable → port-mode 断言红。desktop 分支不探测 3080，netstat/tasklist
+  // 键在两平台均为死处理器，保留以维持「桌面误探端口必被 UNMOCKED 捕获」的防线。
   sys.__setProbeExecutor(makeExecMock({
-    'where sc.exe': WHERE_OK,
+    [TOOL_PROBE_KEY]: TOOL_PROBE_OK,
     'netstat -ano': { stdout: NETSTAT_NONE },
     'tasklist /FO CSV /NH': { stdout: '' },
     curl: { stdout: '200' },
