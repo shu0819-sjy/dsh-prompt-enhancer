@@ -1,0 +1,483 @@
+
+function UpdaterCard(props) {
+  const t = makeT(props);
+  const [repoInput, setRepoInput] = React.useState(updaterCfgState.value.repo);
+  const [dirInput, setDirInput] = React.useState(updaterCfgState.value.targetDir || '');
+  const [checking, setChecking] = React.useState(false);
+  const [result, setResult] = React.useState(null);
+  const [error, setError] = React.useState(null);
+  // v2.5.0：环境检测（null=未检测；host 侧 60s 缓存）
+  const [envItems, setEnvItems] = React.useState(null);
+  const [envChecking, setEnvChecking] = React.useState(false);
+  const [envError, setEnvError] = React.useState(null);
+  // v3.3.x（用户指令·移除插件内重启）：idle|confirm|applying|installed|staged|rolledback；
+  // action 区分当前动作（apply=一键更新）
+  const [applyPhase, setApplyPhase] = React.useState('idle');
+  const [action, setAction] = React.useState(null);
+  const [applyErr, setApplyErr] = React.useState(null);
+  const [diagLog, setDiagLog] = React.useState(null);
+  // 2026-09-12（审查修复·D2）：diagLog 缓存必须放组件作用域——runPullApply 的 .catch 与
+  // pollExecutorStatus 的失败分支都要读它，原 `let lastDiag` 声明在 pollExecutorStatus 内属
+  // 越作用域引用（ReferenceError → 失败文案不显示、按钮卡死）。
+  const lastDiagRef = React.useRef('');
+  const [applyStatus, setApplyStatus] = React.useState(null);
+  // v2.7.0：更新未重启提醒（null=无提醒；命中显示横幅 + 重启命令）
+  const [restartNotice, setRestartNotice] = React.useState(null);
+  // 2026-08-16（方案「设置界面样式与交互对齐官方」）：repo/目录输入 label htmlFor 关联（稳定 id）
+  const updIds = React.useState(() => ({ repo: dshEnhId('dsh-enh-upd-repo'), dir: dshEnhId('dsh-enh-upd-dir') }))[0];
+
+  // v2.4.1（§9-T5）：RPC 携带 sessionId——host 需经会话解析 sandboxPolicy（写入边界=会话工作区）
+  const sessionId = props.useSessions ? props.useSessions((s) => s.current) : undefined;
+
+  // v2.7.0：更新未重启提醒——挂载时检测磁盘插件文件是否晚于本进程加载
+  // （dsh plugin add/update 装了新版本但服务没重启 → 提醒重启 + 给出命令）
+  React.useEffect(() => {
+    let disposed = false;
+    host.call('update/restartNeeded', { serviceName }).then((r) => {
+      if (!disposed && r && r.needed === true) setRestartNotice(r);
+    }).catch(() => { /* 旧 host/动态形态无此 RPC → 静默 */ });
+    return () => { disposed = true; };
+  }, []);
+
+  const repo = updaterRepoOf({ updater: { repo: repoInput, targetDir: '' } });
+  // v2.5.0：可配置服务名/profile（config.updater，缺省 dsh-web / web）
+  const updaterCfg = updaterCfgState.value;
+  const serviceName = typeof updaterCfg.serviceName === 'string' && /^[A-Za-z0-9_-]+$/.test(updaterCfg.serviceName) ? updaterCfg.serviceName : 'dsh-web';
+  const profile = typeof updaterCfg.profile === 'string' && /^[A-Za-z0-9_-]+$/.test(updaterCfg.profile) ? updaterCfg.profile : 'web';
+
+  const persist = (nextRepo, nextDir) => {
+    saveUpdaterConfig({ repo: nextRepo, targetDir: nextDir });
+  };
+
+  const onRepoChange = (value) => {
+    setRepoInput(value);
+    // 方案 §4（L6）：repo 变更 → 清空陈旧结果
+    setResult(null);
+    setError(null);
+    persist(value, dirInput);
+  };
+
+  const onDirChange = (value) => {
+    setDirInput(value);
+    persist(repoInput, value);
+  };
+
+  const doCheck = () => {
+    if (checking) return;
+    setChecking(true);
+    setError(null);
+    // v2.4.1（§9-T6）：浏览器直连 GitHub API（CORS），host 只做解析/比较
+    // v3.1.x（用户报告·检测不到新版本）：手动检测总是拉最新——fetch 禁用缓存（no-store），
+    // host update/check 传 noCache 跳过 5 分钟进程缓存（防刚发布 tag 被旧值覆盖）
+    Promise.all([
+      window.fetch(updaterTagsUrl(repo), { cache: 'no-store' }).then((r) => r.status === 200 ? r.text() : Promise.reject(new Error('tags HTTP ' + r.status))),
+      window.fetch(updaterReleaseUrl(repo), { cache: 'no-store' }).then((r) => r.text()), // 404 属正常（无 release），透传载荷
+    ]).then(([tagsText, releaseText]) => {
+      return host.call('update/check', { repo, sessionId, tagsPayload: tagsText, releasePayload: releaseText, noCache: true });
+    }).then((res) => {
+      const r = res && typeof res === 'object' ? res : {};
+      if (r.ok !== true) {
+        setError(r.message || t('updError'));
+      } else {
+        setResult(r);
+        if (dirInput === '' && typeof r.defaultDir === 'string' && r.defaultDir) {
+          setDirInput(r.defaultDir);
+        }
+      }
+    }).catch((e) => {
+      // 404 = 仓库不存在（tags 接口）；其余网络/解析失败统一提示
+      setError(e && e.message && e.message.indexOf('HTTP 404') !== -1 ? t('updRepoNotFound') : t('updError'));
+    }).then(() => {
+      setChecking(false);
+    });
+  };
+
+  // 2026-08-18（用户需求）：打开插件管理模块时自动执行一次版本检测
+  //（组件挂载即触发；React tab 切换若重挂载则每次进入都自动检查，checking 保护防重入）
+  React.useEffect(() => {
+    doCheck();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // v2.5.0：环境检测（只读；host 60s 缓存）；v2.7.0：带执行器端口供 exec-port 检查
+  const doEnvCheck = () => {
+    if (envChecking) return;
+    setEnvChecking(true);
+    setEnvError(null);
+    host.call('update/envcheck', { serviceName, executorPort: executorPort() }).then((res) => {
+      const r = res && typeof res === 'object' ? res : {};
+      if (r.ok !== true) {
+        setEnvItems(null);
+        setEnvError(r.message || t('updError'));
+      } else {
+        setEnvItems(r.items || []);
+      }
+    }).catch(() => {
+      setEnvError(t('updError'));
+    }).then(() => {
+      setEnvChecking(false);
+    });
+  };
+
+  // v2.6.0：独立执行器（executorEnsure 版本对齐拉起）→ 一键更新使用：
+  // 执行器 apply restart:false（下载 + 校验到 staging，不停服/不安装/不重启）；
+  // 安装由 host update/install 执行，服务重启由用户手动完成。执行器独立存活，不受 DSH 重启影响。
+  const executorPort = () => {
+    const p = Number.isInteger(updaterCfgState.value.executorPort)
+      ? updaterCfgState.value.executorPort : 3081;
+    return p;
+  };
+  // 公共前置：环境检测（block 级拦截）→ executorEnsure（拉起/版本对齐）→ 返回执行器端口
+  // v3.1.6（用户指令·执行器独立化）：更新执行器是独立端口（3081）的独立功能——
+  // 除影响**执行器自身链路执行**的检查（exec-port 端口可用、tools 重启工具）外，
+  // 服务相关检查（service/svc-type/svc-bin）不再 block 一键更新——apply 为 staged
+  // 下载+校验、零端口操作、不依赖服务状态；安装由 host update/install 执行（不触碰端口）。
+  // 服务相关项仍展示在环境检测结果里（warn 提示），不阻止执行器使用。
+  // v3.2（动态端口 fallback）：exec-port 端口冲突不再 block——执行器会自动 fallback
+  // 动态端口（listen 0 + executor.port），executorEnsure 返回真实端口；仅 tools 缺失阻断。
+  const EXECUTOR_LINK_BLOCKS = ['tools'];
+  const ensureExecutor = () => {
+    return host.call('update/envcheck', { serviceName, executorPort: executorPort() }).then((envRes) => {
+      const er = envRes && typeof envRes === 'object' ? envRes : {};
+      const blockMissing = (er.ok === true && Array.isArray(er.blockMissing))
+        ? er.blockMissing.filter((k) => EXECUTOR_LINK_BLOCKS.includes(k)) : [];
+      if (er.ok === true && blockMissing.length > 0) {
+        const names = blockMissing
+          .map((k) => { const def = ENV_ITEMS.find((i) => i.key === k); return def ? t(def.label) : k; })
+          .join('、');
+        setApplyErr(t('updApplyBlocked') + ' ' + names);
+        setEnvItems(er.items || null);
+        setApplyPhase('idle');
+        setAction(null);
+        return null;
+      }
+      if (er.ok === true && Array.isArray(er.items)) setEnvItems(er.items);
+      return host.call('update/executorEnsure', { port: executorPort() });
+    });
+  };
+
+  // v3.3.x（用户指令·移除插件内重启）：一键更新终态 = 安装已 staged 的包
+  // （host update/install：纯安装，零端口操作、不重启任何东西）→ 提示用户手动重启 DSH 生效
+  const installStaged = () => {
+    setApplyErr(null);
+    setApplyStatus(t('updApplying'));
+    host.call('update/install', { profile, serviceName }).then((res) => {
+      const r = res && typeof res === 'object' ? res : {};
+      if (r.ok !== true) {
+        setApplyStatus(null);
+        setApplyErr((r.message ? r.message + ' ' : '') + t('updApplyRestartFailed'));
+        setApplyPhase('idle');
+        setAction(null);
+        return;
+      }
+      // 终态：已安装，等用户手动重启 DSH（updStaged 文案）
+      setApplyErr(null);
+      setApplyStatus(null);
+      setApplyPhase('staged');
+    }).catch(() => {
+      setApplyStatus(null);
+      setApplyErr(t('updApplyExecutorDown'));
+      setApplyPhase('idle');
+      setAction(null);
+    });
+  };
+  // status 轮询（每 1s）：观察 apply(restart:false) 的下载/校验进度与终态（staged / failed）
+  const pollExecutorStatus = (port) => {
+    // v3.3.x（用户指令·移除插件内重启）：轮询只用于观察安装进度——1s 一 tick，
+    // 用 elapsed 展示已用秒（旧「重启倒计时/轮次」随重启链一并移除）；
+    // 连续失败 15 次（约 15s 无响应）→ 判定执行器不可达并终止
+    const startedAt = Date.now();
+    let failCount = 0;
+    const tick = () => {
+      executor.call('status', {}, port).then((st) => {
+        const s = st && typeof st === 'object' ? st : {};
+        failCount = 0;
+        if (s && typeof s.diagLog === 'string' && s.diagLog.trim()) lastDiagRef.current = s.diagLog.trim();
+        const elapsed = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+        if (s.phase === 'healthy') {
+          setApplyErr(null);
+          // v3.1.x（用户需求）：服务已重启完成 → 清除「未重启」提醒横幅
+          setRestartNotice(null);
+          if (/rolled back/i.test(s.message || '')) {
+            setApplyStatus(t('updApplyRolledBack'));
+            setApplyPhase('rolledback');
+          } else {
+            // v3.3.x（用户指令·移除插件内重启）：不再有「重启成功」终态——
+            // 执行器空闲（未在安装/重启）时回到可操作状态
+            setApplyStatus(null);
+            setApplyPhase('idle');
+          }
+          return;
+        }
+        if (s.phase === 'failed') {
+          const dl = (s && typeof s.diagLog === 'string' && s.diagLog.trim()) ? s.diagLog.trim() : lastDiagRef.current;
+          setDiagLog(dl || null);
+          setApplyErr(s.message || t('updApplyRestartFailed'));
+          setApplyStatus(null);
+          setApplyPhase('idle');
+          return;
+        }
+        // v3.3.x（用户指令·移除插件内重启）：执行器已把新版本 staged（下载 + 校验完成）
+        // → 交给 host update/install 安装（不重启任何东西）；装完提示用户手动重启 DSH 生效
+        if (s.phase === 'staged') {
+          installStaged();
+          return;
+        }
+        // 防御：旧执行器/历史状态残留的 installed（已安装，等用户手动重启）
+        if (s.phase === 'installed') {
+          setApplyErr(null);
+          setApplyStatus(null);
+          setApplyPhase('staged');
+          return;
+        }
+        const phaseStatus = {
+          validating: t('updApplyStaging'),
+          staging: t('updApplyStaging'),
+          envcheck: t('updApplyEnvcheck'),
+          preparing: t('updApplyPreparing'),
+          installing: t('updApplying'),
+          rollback: t('updApplyRollingBack'),
+        };
+        // v3.2.1-s（用户需求·进度反馈）：apply 流程步骤序号 + staging 下载百分比
+        const PHASE_STEP = { validating: 1, staging: 2, envcheck: 3, preparing: 4, installing: 5, rollback: 6 };
+        if (phaseStatus[s.phase]) {
+          setApplyErr(null);
+          const step = PHASE_STEP[s.phase] || 0;
+          let extra = '';
+          // v3.2.1-s（下载进度）：staging 阶段展示下载百分比与镜像源（执行器 state.download）
+          if (s.phase === 'staging' && s.download) {
+            const dl = s.download;
+            const pct = typeof dl.percent === 'number' ? dl.percent : 0;
+            const srcTxt = (dl.attempt && dl.attempts) ? (' · 源 ' + dl.attempt + '/' + dl.attempts) : '';
+            extra = ' · 下载 ' + pct + '%' + srcTxt;
+          }
+          setApplyStatus((step ? '[第 ' + step + ' 步] ' : '') + phaseStatus[s.phase] + extra + ' · 已用 ' + elapsed + 's');
+          setApplyPhase('applying');
+          setTimeout(tick, 1000);
+          return;
+        }
+      }).catch(() => {
+        // 执行器暂时不可达（执行器未起/被重建）——连续失败 15 次才终止
+        failCount += 1;
+        if (failCount >= 15) {
+          // v3.3.x（用户指令·移除插件内重启）：不再经 host 自愈重拉执行器/重发重启 RPC——
+          // 直接呈现错误（执行器不可达 = 更新无法继续），保留缓存 diagLog 作为根因线索
+          setDiagLog(lastDiagRef.current || null);
+          setApplyErr(t('updApplyExecutorDown'));
+          setApplyStatus(null);
+          setApplyPhase('idle');
+          return;
+        }
+        setTimeout(tick, 1000);
+      });
+    };
+    tick();
+  };
+
+  const startConfirm = (which) => {
+    // v3.3.x（用户指令·移除插件内重启）：确认态只剩「一键更新」——idle 与防守性 installed 可进入
+    if (applyPhase !== 'idle' && applyPhase !== 'installed') return;
+    setAction(which);
+    setApplyPhase('confirm');
+  };
+  const cancelApply = () => {
+    if (applyPhase === 'confirm') { setApplyPhase('idle'); setAction(null); }
+  };
+
+  // 一键更新：执行器 apply restart:false（下载 + 校验到 staging，不停服/不安装/不重启）
+  const runPullApply = () => {
+    if (applyPhase !== 'confirm' || action !== 'apply') return;
+    // v2.9.x：防御——未检测版本（result 缺失）时直接提示，避免 result.remoteTag 抛 TypeError
+    // 被外层 catch 误报为「执行器不可用」
+    if (!result || !result.remoteTag) {
+      setApplyErr(t('updCheckFirst'));
+      setApplyPhase('idle');
+      setAction(null);
+      return;
+    }
+    setApplyPhase('applying');
+    setApplyErr(null);
+    setApplyStatus(null);
+    // v3.2（动态端口 fallback）：apply 完成后轮询用执行器实际端口（executorEnsure 返回）
+    let applyPort = executorPort();
+    ensureExecutor().then((ensureRes) => {
+      if (!ensureRes) return;
+      const en = ensureRes && typeof ensureRes === 'object' ? ensureRes : {};
+      if (en.ok !== true) {
+        setApplyErr((en.message ? en.message + ' ' : '') + t('updError'));
+        setApplyPhase('idle');
+        setAction(null);
+        return null;
+      }
+      applyPort = (en.port && en.port > 0) ? en.port : applyPort;
+      // v3.1.x（职责划分·用户指令）：执行前校验执行器版本——仅下载/校验（staged 模式）
+      // 需执行器 ≥0.1.8；过旧则阻止并提示重启 dsh-web 升级执行器
+      return executor.call('ping', {}, en.port).then((p) => {
+        const pv = p && typeof p === 'object' && typeof p.version === 'string' ? p.version : '';
+        if (!executorVersionAtLeast(pv)) {
+          setApplyErr(t('updExecutorTooOld').replace('{v}', pv || '?'));
+          setApplyPhase('idle');
+          setAction(null);
+          return null;
+        }
+        // accepted 立即返回，下载进度走 status 轮询（apply 仅下载+校验，零端口操作）
+        return executor.call('apply', { repo, tag: result.remoteTag, profile, serviceName, port: en.port }, en.port);
+      });
+    }).then((applyRes) => {
+      if (!applyRes) return;
+      const ar = applyRes && typeof applyRes === 'object' ? applyRes : {};
+      if (ar.ok !== true) {
+        setApplyErr((ar.message ? ar.message + ' ' : '') + t('updError'));
+        setApplyPhase('idle');
+        setAction(null);
+        return;
+      }
+      setApplyStatus(t('updApplying'));
+      pollExecutorStatus(applyPort);
+    }).catch(() => {
+      setDiagLog(lastDiagRef.current || null);
+      setApplyErr(t('updApplyExecutorDown'));
+      setApplyPhase('idle');
+      setAction(null);
+    });
+  };
+
+  let statusNode = null;
+  if (result) {
+    const text = result.status === 'outdated' ? t('updOutdated')
+      : result.status === 'current' ? (result.ahead ? t('updAhead') : t('updCurrent'))
+      : t('updUnknown');
+    statusNode = React.createElement('span', {
+      className: result.status === 'outdated' ? 'dsh-plg-upd-outdated' : 'dsh-plg-upd-ok',
+    }, text);
+  }
+
+  const busy = applyPhase === 'applying';
+  const outdated = !!(result && result.status === 'outdated');
+  // 更新按钮：busy/已安装/确认中/未检出新版本时禁用
+  const pullApplyDisabled = busy || applyPhase === 'staged' || applyPhase === 'installed'
+    || checking || envChecking || !outdated;
+
+  return React.createElement('div', { className: 'dsh-plg-card dsh-plg-upd' },
+    React.createElement('div', { className: 'dsh-plg-head' },
+      React.createElement('span', { className: 'dsh-plg-name' }, t('updTitle')),
+    ),
+    // v2.7.0：更新未重启提醒横幅（装新版本未重启时显示，含重启命令）
+    restartNotice
+      ? React.createElement('div', { className: 'dsh-plg-restart-notice', role: 'status' },
+          React.createElement('span', { className: 'dsh-plg-restart-text' }, t('updRestartNeeded')),
+          React.createElement('code', { className: 'dsh-plg-restart-cmd' }, restartNotice.command || ''),
+        )
+      : null,
+    // 行 1：repo 输入 + 检测按钮 + 环境检测按钮（v2.5.0，样式同检测按钮）
+    React.createElement('div', { className: 'dsh-plg-row' },
+      React.createElement('label', { className: 'dsh-plg-label', htmlFor: updIds.repo }, t('updRepo')),
+      React.createElement('input', {
+        id: updIds.repo,
+        className: 'dsh-plg-input',
+        value: repoInput,
+        spellCheck: false,
+        placeholder: UPDATER_DEFAULT_REPO,
+        onChange: (e) => onRepoChange(e.target.value),
+      }),
+      React.createElement('button', {
+        type: 'button',
+        className: 'dsh-plg-btn dsh-plg-btn-primary',
+        disabled: checking || busy,
+        onClick: doCheck,
+      }, checking ? t('updChecking') : t('updCheck')),
+      React.createElement('button', {
+        type: 'button',
+        className: 'dsh-plg-btn dsh-plg-btn-primary',
+        disabled: checking || envChecking || busy,
+        onClick: doEnvCheck,
+      }, envChecking ? t('envChecking') : t('envBtn')),
+    ),
+    // v2.5.0：环境检测结果区（✓ 绿 / ⚠ 黄灰 / ✗ 红 + 指引）
+    envItems || envError
+      ? React.createElement('div', { className: 'dsh-plg-env' },
+          React.createElement('div', { className: 'dsh-plg-row' },
+            React.createElement('span', { className: 'dsh-plg-label' }, t('envTitle')),
+          ),
+          envError
+            ? React.createElement('div', { className: 'dsh-plg-error', role: 'status' }, envError)
+            : null,
+          envItems
+            ? React.createElement('div', { className: 'dsh-plg-env-list' },
+                ENV_ITEMS.map((def) => {
+                  const it = envItems.find((x) => x.key === def.key);
+                  if (!it) return null;
+                  const cls = it.ok ? 'ok' : (it.warn ? 'warn' : 'fail');
+                  // v3.2.1-o（环境检测重构）：有映射走 i18n；无映射（如 port-pid 的动态 PID）直接显示原文
+                  const detailKey = ENV_DETAIL_TEXT[it.detail];
+                  const detailText = detailKey ? t(detailKey) : (it.detail ? String(it.detail) : t('envOk'));
+                  return React.createElement('div', { key: def.key, className: 'dsh-plg-env-item dsh-plg-env-' + cls },
+                    React.createElement('span', { className: 'dsh-plg-env-mark' }, it.ok ? '✓' : (it.warn ? '⚠' : '✗')),
+                    React.createElement('span', { className: 'dsh-plg-env-label' }, t(def.label)),
+                    React.createElement('span', { className: 'dsh-plg-env-detail' }, detailText),
+                  );
+                }),
+              )
+            : null,
+        )
+      : null,
+    // 行 2：结果区（本地/远端/状态；release 元数据仅同名时展示）
+    result
+      ? React.createElement('div', { className: 'dsh-plg-row' },
+          React.createElement('span', { className: 'dsh-plg-muted' }, t('updLocal') + ' v' + result.local),
+          React.createElement('span', { className: 'dsh-plg-muted' }, t('updRemote') + ' v' + result.remote),
+          statusNode,
+        )
+      : null,
+    result && result.body
+      ? React.createElement('div', { className: 'dsh-plg-upd-body' }, result.body)
+      : null,
+    // 行 3：目标目录 + 一键更新（v3.3.x 用户指令·移除插件内重启：执行器 apply 下载+校验 →
+    // host update/install 安装 → 提示用户手动重启 DSH 生效；确认/取消两态同放本行行末）
+    React.createElement('div', { className: 'dsh-plg-row' },
+      React.createElement('label', { className: 'dsh-plg-label', htmlFor: updIds.dir }, t('updDir')),
+      React.createElement('input', {
+        id: updIds.dir,
+        className: 'dsh-plg-input',
+        value: dirInput,
+        spellCheck: false,
+        placeholder: result && result.defaultDir ? result.defaultDir : '',
+        onChange: (e) => onDirChange(e.target.value),
+      }),
+      React.createElement('button', {
+        type: 'button',
+        className: 'dsh-plg-btn ' + (applyPhase === 'confirm' && action === 'apply' ? 'dsh-plg-btn-danger' : 'dsh-plg-btn-primary'),
+        disabled: pullApplyDisabled,
+        onClick: applyPhase === 'confirm' && action === 'apply' ? runPullApply : () => startConfirm('apply'),
+      }, applyPhase === 'confirm' && action === 'apply' ? t('updPullApplyConfirm')
+        : applyPhase === 'applying' ? t('updApplying')
+        : (applyPhase === 'staged' || applyPhase === 'installed') ? t('updStagedShort')
+        : t('updPull')),
+
+      applyPhase === 'confirm'
+        ? React.createElement('button', {
+            type: 'button',
+            className: 'dsh-plg-btn',
+            onClick: cancelApply,
+          }, t('cancel'))
+        : null,
+    ),
+    // v3.3.x：已安装（未重启）提示——新版本已落地，等用户手动重启 DSH 生效
+    (applyPhase === 'staged' || applyPhase === 'installed')
+      ? React.createElement('div', { className: 'dsh-plg-save dsh-plg-save-ok', role: 'status' }, t('updStaged'))
+      : null,
+    applyStatus
+      ? React.createElement('div', { className: 'dsh-plg-status', role: 'status' }, applyStatus)
+      : null,
+    applyErr
+      ? React.createElement('div', { className: 'dsh-plg-error', role: 'status' }, applyErr)
+      : null,
+    diagLog
+      ? React.createElement('pre', {
+          className: 'dsh-plg-diag-log',
+          style: { margin: '4px 0 0', padding: '8px', maxHeight: '180px', overflow: 'auto', fontSize: '12px', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-all', background: 'rgba(127,127,127,0.12)', borderRadius: '6px', textAlign: 'left' },
+        }, t('updDiagTitle') + '\n' + diagLog)
+      : null,
+    error ? React.createElement('div', { className: 'dsh-plg-error', role: 'status' }, error) : null,
+  );
+}

@@ -1,0 +1,249 @@
+function EnhanceButton(props) {
+  const t = makeT(props);
+  // v3.4.x（Issue #8 官方槽位契约）：会话级槽位条目由渲染器注入 sessionId prop + useSession/useInput 选择器 hook
+  // （@deepseek-ai/dsh-client-ui-renderer 0.1.2-rc.1 将 uiSession hooks 合成为 use<Name> hook、props 原样展开，
+  //   对 conversation.input.right 恒无 props.session/props.input —— 旧实现令 ✨/🎤 拿不到会话致永不渲染或降级）；
+  //   旧宿主（提供 props.session / props.input）回退保持兼容。hook 以 props 上是否存在函数为恒定条件，hook 序稳定。
+  const useSessionHook = typeof props.useSession === 'function' ? props.useSession : null;
+  const useInputHook = typeof props.useInput === 'function' ? props.useInput : null;
+  const sessionSnap = useSessionHook ? useSessionHook((s) => s) : null;
+  const inputSnap = useInputHook ? useInputHook((s) => s) : null;
+  const sessionId = (sessionSnap && sessionSnap.sessionId) || (props.session && props.session.sessionId) || props.sessionId;
+  const input = inputSnap || props.input || {};
+  const draft = typeof input.draft === 'string' ? input.draft : '';
+  const inputActions = props.inputActions;
+
+  // v3.3.x-fix：effect 内安全使用最新 actions——此前回注分支引用了未声明的
+  // inputActionsRef，一旦执行即 ReferenceError（f6fa822 半成品缺陷）
+  const inputActionsRef = React.useRef(inputActions);
+  inputActionsRef.current = inputActions;
+
+  const [, setVersion] = React.useState(0);
+  const draftRef = React.useState({ current: draft })[0];
+  draftRef.current = draft;
+  // v3.3.x（会话切换增强保持）：effect 内安全使用最新 inputActions
+
+  // 2026-08-17（连通性测试预计耗时）：同步当前草稿长度到全局，供设置页测试连通性读取。
+  React.useEffect(() => { setLastDraft(draft); }, [draft]);
+
+  React.useEffect(() => subscribe(sessionId, () => setVersion((v) => v + 1)), [sessionId]);
+
+  // v2.3（§7.2/T25）：订阅配置——模式/记忆切换后按钮标签即时同步
+  const [, setCfg] = React.useState(0);
+  React.useEffect(() => subscribeConfig(() => setCfg((v) => v + 1)), []);
+  // v3.3.x（会话切换增强保持）：向全局登记当前活动会话——完成回调据此决定是否直接注入
+  // v3.3.x-fix：登记调用此前缺失（activeSessionId 恒 null → 每次完成都判「已切走」→ 草稿永不写回）
+  React.useEffect(() => {
+    setActiveSession(sessionId);
+    return () => { if (getActiveSession() === sessionId) setActiveSession(null); };
+  }, [sessionId]);
+
+  // v3.3.x（会话切换增强保持）：草稿被外部还原为原始文本（切走期间服务端回灌）时，
+  // 自动重新应用增强结果而非丢弃；用户真实编辑了其他内容才按原语义消费。
+  React.useEffect(() => {
+    const s = storeFor(sessionId);
+    if (!s || s.phase !== 'result') return;
+    if (draft === s.enhanced) return;
+    if (s.backup !== '' && draft === s.backup) {
+      safeSetDraft(inputActionsRef.current, s.enhanced);
+      notify(sessionId);
+      return;
+    }
+    s.phase = 'idle';
+    s.enhanced = '';
+    s.error = null;
+    clearResultStore(sessionId);
+    notify(sessionId);
+  }, [draft, sessionId]);
+
+  // v3.0s（用户修正·发送清空记忆链）：发送（基座 submit 成功，draft 随之清空）→ 清空
+  // 记忆链并重置 seen 标记——「持续记忆」仅限发送前一轮优化内的会话，发送后新一轮
+  // 迭代从零开始（链空 + 无标记 → 重新「首次轻量兜底」）；手动清空输入框（phase 全程
+  // plain）不清除——内容删除可能表示方向调整；发送失败（draft 保留）也不清除。
+  // 发送信号 = 基座 phase 进入 submitting/adjudicating（submit 飞行期，draft 未清）。
+  const sendSeenRef = React.useRef(false);
+  React.useEffect(() => {
+    const ph = input && typeof input.phase === 'string' ? input.phase : '';
+    if (ph === 'submitting' || ph === 'adjudicating') {
+      sendSeenRef.current = true;
+    } else if (typeof draft === 'string' && draft.trim() !== '') {
+      // 非发送期且草稿非空：无在途发送（含发送失败 draft 保留）→ 复位
+      sendSeenRef.current = false;
+    }
+    if (typeof draft !== 'string' || draft.trim() !== '') return;
+    const s = storeFor(sessionId);
+    if (s.optimized === true) {
+      s.optimized = false;
+      notify(sessionId);
+    }
+    if (sendSeenRef.current === true) {
+      sendSeenRef.current = false;
+      if (s.memoryRounds.length > 0) {
+        s.memoryRounds = [];
+        notify(sessionId);
+      }
+      clearSeen(sessionId);
+    }
+  }, [draft, input && input.phase, sessionId]);
+
+  // v3.3.x（会话切换增强保持）：切走不再取消在途优化——后台继续完成，回到该会话即见结果。
+  React.useEffect(() => () => {
+    // 卸载后仅回收空闲条目（enhancing/result 态保留）
+    releaseStoreIfIdle(sessionId);
+  }, [sessionId]);
+
+  // v2.3（§7.3）：enhancing 期间轮询 enhance/progress（500ms），stage → 本地进度文案
+  // （hooks 必须位于条件提前 return 之前，保持每次渲染顺序稳定）
+  const s = sessionId !== undefined ? storeFor(sessionId) : null;
+  const phase = s ? s.phase : 'idle';
+  // v3.0r（细粒度进度反馈）：progress 对象 {stage, detailKey, detailArgs, step, total, elapsedMs}
+  const [prog, setProg] = React.useState(null);
+  React.useEffect(() => {
+    if (sessionId === undefined) return undefined;
+    const st = storeFor(sessionId);
+    if (st.phase !== 'enhancing') { setProg(null); return undefined; }
+    let disposed = false;
+    const seq = st.seq;
+    setProg(null);
+    // v2.3.1：动态 client 无浏览器 timer 全局——经 ctx timer 服务（inject:['timer']）；
+    // 服务不可用时静默降级为默认「优化中…」文案（§7.3）
+    if (!timerSvc || typeof timerSvc.interval !== 'function') return undefined;
+    const disposer = timerSvc.interval(() => {
+      host.call('enhance/progress', { sessionId, seq }).then((r) => {
+        if (disposed || !r || r.ok !== true) return;
+        setProg({
+          stage: typeof r.stage === 'string' ? r.stage : '',
+          detailKey: typeof r.detailKey === 'string' ? r.detailKey : '',
+          detailArgs: r.detailArgs && typeof r.detailArgs === 'object' ? r.detailArgs : null,
+          step: typeof r.step === 'number' ? r.step : 0,
+          total: typeof r.total === 'number' ? r.total : 0,
+          elapsedMs: typeof r.elapsedMs === 'number' ? r.elapsedMs : 0,
+        });
+      }).catch(() => { /* 轮询失败静默降级为默认「优化中…」文案（§7.3） */ });
+    }, 500);
+    return () => { disposed = true; disposer(); };
+  }, [phase, sessionId, s ? s.seq : 0]);
+
+  if (!inputActions || sessionId === undefined) return null;
+
+  let onClick;
+  let disabled = false;
+  let title;
+  let cls = 'dsh-enh-btn';
+
+  if (phase === 'enhancing') {
+    // v3.0r（细粒度进度反馈）：进度文案优先级 detailKey 模板 > stage 文案 > 默认「优化中…」；
+    // 末尾追加已用秒数（如「正在搜索 2/3：体素引擎 · 8s」），任何时刻都有动态变化
+    // 2026-08-18 修复：此前 `let prog = t('enhancing')` 把进度对象覆盖成字符串，
+    // 导致 prog.stage/detailKey/elapsedMs 判断全部失效——步骤进度从未显示（含模型序号）。
+    // 现分离：st = 进度对象（判断用），progText = 文案（显示用）。
+    let progText = t('enhancing');
+    const st = prog;
+    if (st) {
+      if (st.stage) {
+        // 2026-08-18（用户需求）：llm 阶段显示「N 优化中」——N = 当前尝试的模型序号（step），
+        // 失败切换模型时序号递增（1→2→3），用户能判断是模型配置问题而非插件问题
+        if (st.stage === 'llm' && st.step > 0) {
+          // v3.2.4（用户需求）：模型 1（默认）直接显示「正在优化」；失败切换后显示「{n}正在优化」
+          progText = (st.step > 1 ? t('enhancingModel') : t('enhancing')).replace('{n}', String(st.step));
+        } else {
+          const key = 'stage' + st.stage.charAt(0).toUpperCase() + st.stage.slice(1);
+          const localized = t(key);
+          if (localized !== key) progText = localized;
+        }
+      }
+      // llm 阶段已显示模型序号（含重试标记），跳过 detailKey 覆盖；其余 stage 保留 detail 模板
+      if (st.detailKey && st.stage !== 'llm') {
+        const dkey = 'stageDetail' + st.detailKey.charAt(0).toUpperCase() + st.detailKey.slice(1);
+        let tmpl = t(dkey);
+        if (tmpl !== dkey) {
+          const a = st.detailArgs || {};
+          // 2026-08-18（用户需求·publish 细化）：{current}/{total} 优先取 detailArgs，
+          // 缺失时回退 progress 的 step/total（buildV2ContextBlock mark 只传 step/total，judge 传 null）
+          const cur = a.current != null ? a.current : st.step;
+          const tot = a.total != null ? a.total : st.total;
+          tmpl = tmpl
+            .replace('{current}', String(cur != null ? cur : ''))
+            .replace('{total}', String(tot != null ? tot : ''))
+            .replace('{query}', String(a.query != null ? a.query : ''));
+          progText = tmpl;
+        }
+      }
+      // v3.2.4（用户需求·文字 ≤6 字）：移除秒数追加，动态点提供持续动态反馈
+    }
+    onClick = () => cancelEnhance(sessionId, inputActions);
+    title = t('titleBusy');
+    cls += ' dsh-enh-btn-busy dsh-enh-btn-text';
+    return React.createElement('button', {
+      type: 'button',
+      className: cls,
+      onClick,
+      title,
+      tabIndex: -1,
+      'aria-label': t('enhanceButton'),
+    },
+      React.createElement('span', { className: 'dsh-enh-spin', 'aria-hidden': true }),
+      // v2.3.3（§7.10）：hover 闪烁修复——progress 文档流占位（宽度恒定），
+      // cancel absolute 覆盖其上，hover 只切 opacity（无尺寸抖动）
+      React.createElement('span', { className: 'dsh-enh-status', 'aria-hidden': true },
+        React.createElement('span', { className: 'dsh-enh-progress' }, progText),
+        React.createElement('span', { className: 'dsh-enh-cancel' }, t('cancel')),
+      ),
+    );
+  }
+  if (phase === 'result') {
+    onClick = () => undo(sessionId, inputActions);
+    title = t('titleResult');
+    cls += ' dsh-enh-btn-result dsh-enh-btn-text';
+  } else {
+    // v2.3.3（§7.10）：空输入时按钮 = 记忆开关（点击切换 config.memory，外观不变——
+    // ✨ 图标饱和度已表达记忆状态；非空时守卫/优化逻辑照旧）
+    const ok = guardPasses(draft, input);
+    const empty = draft.trim() === '';
+    if (empty) {
+      disabled = false;
+      onClick = () => { saveConfig({ memory: !configState.value.memory }); };
+      title = configState.value.memory ? t('titleMemoryOn') : t('titleMemoryOff');
+    } else {
+      disabled = !ok;
+      onClick = () => {
+        if (!guardPasses(draft, input)) return;
+        enhance(sessionId, draft, inputActions, draftRef);
+      };
+      // v2.6.2（继续优化）：已成功应用过 ≥1 轮 → hover 提示区分（首次/继续）
+      const isContinue = !!s && s.optimized === true;
+      title = ok ? (isContinue ? t('titleContinue') : t('titleIdle'))
+        : draft.startsWith('/') ? t('titleCommand')
+        : t('titleBusyInput');
+    }
+    cls += ' dsh-enh-btn-text';
+  }
+
+  return React.createElement('button', {
+    type: 'button',
+    className: cls,
+    onClick,
+    disabled,
+    title,
+    // v22（C6）：不可选中（不可 Tab 聚焦），仅支持点击触发
+    tabIndex: -1,
+    'aria-label': t('enhanceButton'),
+  },
+    // v2.6.2（继续优化）：已优化过一轮且草稿已修改 → 纯文字「继续优化」（无 ✨ 图标）；
+    // 首次 → ✨ + 模式短标签（记忆饱和度仅作用于 ✨，continue 态无图标故不受影响）
+    phase === 'result' ? null
+      : (s && s.optimized === true)
+        ? React.createElement('span', { className: 'dsh-enh-mode' }, t('btnContinue'))
+        : React.createElement(React.Fragment, null,
+            // v2.3.2（§7.2）：记忆状态 → 图标饱和度（仅影响 ✨，文字饱和度不变）：
+            // 记忆开=正常彩色（无 dim 类）/ 记忆关=低饱和（dsh-enh-icon-dim，filter:saturate(.2)）
+            React.createElement('span', {
+              className: 'dsh-enh-icon' + (configState.value.memory === true ? '' : ' dsh-enh-icon-dim'),
+              'aria-hidden': true,
+            }, '✨'),
+            React.createElement('span', { className: 'dsh-enh-mode' }, modeShortLabel(t, configState.value.mode)),
+          ),
+    phase === 'result' ? (s && s.fallbackUsed === true && s.lastModel ? t('resultFallback').replace('{model}', prettifyModel(s.lastModel)) : t('result')) : null,
+  );
+}
+

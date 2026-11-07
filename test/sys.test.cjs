@@ -1,0 +1,512 @@
+﻿'use strict';
+// sys.cjs 共享原语单测（M0 基线补充）
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
+const net = require('node:net');
+const sys = require('../lib/sys.cjs');
+const psvc = require('../lib/platform-service.cjs');
+
+// v3.4.x：probeEnv golden 契约与宿主运行时解耦。桌面端（Electron / execPath 含 dsh-desktop）
+// 与纯 node 服务端会走不同分支，而 golden 契约锚定的是「服务模式」形态——文件内统一锁定，
+// 避免同一断言在不同宿主下一红一绿。SYS-14 显式验证桌面分支。
+test.beforeEach(() => { sys.__setDesktop(false); });
+test.afterEach(() => { sys.__setDesktop(null); });
+
+test('SYS-01 executorDir 返回外部版本化目录', () => {
+  const dir = sys.executorDir('0.1.6');
+  assert.ok(dir.includes('dsh-prompt-enhancer'));
+  assert.ok(dir.includes('executor'));
+  assert.ok(dir.endsWith(path.join('0.1.6')), '版本号作为末级目录');
+});
+
+test('SYS-02 profileDir 返回 DSH profile 路径', () => {
+  // v3.4.x：断言与宿主环境解耦——显式覆盖参数优先（确定性），再校验与 DSH_HOME 口径同源。
+  const override = path.join(os.tmpdir(), 'dsh-home-contract');
+  assert.equal(sys.profileDir('web', override), path.join(override, 'profiles', 'web'), '显式覆盖参数生效');
+  const expectedHome = process.env.DSH_HOME
+    || path.join(process.env.USERPROFILE || process.env.HOME || '', '.dsh');
+  assert.equal(sys.profileDir('web'), path.join(expectedHome, 'profiles', 'web'), '与 dshHomeDir 同源口径');
+  assert.ok(sys.profileDir('web').endsWith(path.join('profiles', 'web')), 'profile 路径拼接正确');
+});
+
+test('SYS-03 isLocalTarballInstallArgs 只允许 staging 内 tarball', () => {
+  const good = sys.isLocalTarballInstallArgs([
+    'node', 'plugin', '--profile', 'web', 'add', path.join(sys.STAGING_DIR, 'dsh-prompt-enhancer-2.8.3.tgz'),
+  ]);
+  assert.equal(good, true, 'staging 内 tgz 应放行');
+
+  const badPath = sys.isLocalTarballInstallArgs([
+    'node', 'plugin', '--profile', 'web', 'add', 'C:\\Temp\\evil.tgz',
+  ]);
+  assert.equal(badPath, false, 'staging 外路径应拒绝');
+
+  const badExt = sys.isLocalTarballInstallArgs([
+    'node', 'plugin', '--profile', 'web', 'add', path.join(sys.STAGING_DIR, 'evil.zip'),
+  ]);
+  assert.equal(badExt, false, '非 tgz 应拒绝');
+
+  const badArgs = sys.isLocalTarballInstallArgs(['node', 'plugin', '--profile', 'web', 'install', 'x.tgz']);
+  assert.equal(badArgs, false, '非 add 命令应拒绝');
+});
+
+test('SYS-04 isEnvcheckBlocked 识别 block 失败项', () => {
+  const blocked = [
+    { key: 'service', level: 'block', ok: false },
+    { key: 'net', level: 'warn', ok: false },
+  ];
+  assert.equal(sys.isEnvcheckBlocked(blocked), true, '存在 block 失败应 true');
+
+  const warnOnly = [
+    { key: 'service', level: 'block', ok: true },
+    { key: 'net', level: 'warn', ok: false },
+  ];
+  assert.equal(sys.isEnvcheckBlocked(warnOnly), false, '仅 warn 失败应 false');
+});
+
+test('SYS-05 extractPure 暴露新 PURE 函数', () => {
+  const body = `
+// ==PURE-BEGIN==
+function buildTarballUrl(repo, tag) { return 'https://github.com/' + repo + '/releases/download/' + tag; }
+function buildLocalInstallArgs(a, b, c) { return [a, b, c]; }
+function mergeEnvPath(a, b) { return a + ';' + b; }
+function buildRestartPlan() { return {}; }
+function buildInstallArgs() { return []; }
+// ==PURE-END==
+`;
+  const pure = sys.extractPure(body);
+  assert.equal(typeof pure.buildTarballUrl, 'function');
+  assert.equal(typeof pure.buildLocalInstallArgs, 'function');
+  assert.equal(typeof pure.mergeEnvPath, 'function');
+});
+
+/* ================= 批次C（P1-4）：probeEnv 异步化 + net 熔断 ================= */
+
+/** promisified-execFile 契约 mock：handlers 按 'cmd arg1 arg2' 匹配（缺省回退 handlers[cmd]）；
+ *  值为 resolve 对象 {stdout,stderr}、Error 实例（reject）、或 (args)=>… 工厂。 */
+function makeExecMock(handlers) {
+  const calls = [];
+  const fn = async (cmd, args) => {
+    const key = cmd + (args.length ? ' ' + args.join(' ') : '');
+    calls.push(key);
+    const h = handlers[key] !== undefined ? handlers[key] : handlers[cmd];
+    if (h === undefined) throw Object.assign(new Error('unexpected exec: ' + key), { code: 'UNMOCKED' });
+    if (typeof h === 'function') return await h(args);
+    if (h instanceof Error) throw h;
+    return h;
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+const WHERE_OK = { stdout: 'C:\\WINDOWS\\System32\\sc.exe\r\n' };
+/** 平台工具解析命令（与 lib/sys.cjs probeEnv 预检同源）：win `where sc.exe`；darwin `which launchctl`；
+ *  linux `which systemctl`。mock 键 =「命令 参数」——POSIX 侧工具预检与 tools 项是同一命令，共用一个 handler。
+ *  注：不把「发行版一定装了 which」当前提——POSIX 真机若缺 which，runProbeAsync 映射 ENOENT，
+ *  probeEnv 照既有语义落「工具不可达」早退；本组用例注入 mock 执行器，故与真实 PATH 无关。 */
+const TOOL_PROBE_TARGET = process.platform === 'win32' ? 'sc.exe'
+  : process.platform === 'darwin' ? 'launchctl' : 'systemctl';
+const TOOL_PROBE_KEY = (process.platform === 'win32' ? 'where' : 'which') + ' ' + TOOL_PROBE_TARGET;
+const TOOL_PROBE_OK = process.platform === 'win32' ? WHERE_OK : { stdout: '/usr/bin/' + TOOL_PROBE_TARGET + '\n' };
+const NETSTAT_3080_4242 = '\r\nTCP    0.0.0.0:3080           0.0.0.0:0              LISTENING       4242\r\n';
+const NETSTAT_NONE = '\r\nTCP    0.0.0.0:9999           0.0.0.0:0              LISTENING       99\r\n';
+const TASKLIST_SVC0 = '"node.exe","4242","Services","0","8,888 K"\r\n';
+const CURL_EXIT7 = Object.assign(new Error('curl exit 7'), { code: 7 });
+
+/** win 全链标准 mock（工具预检过 + 3080 有监听者 + curl 可控）。 */
+function winChainMock(curlResult) {
+  return makeExecMock({
+    [TOOL_PROBE_KEY]: TOOL_PROBE_OK,
+    'netstat -ano': { stdout: NETSTAT_3080_4242 },
+    'tasklist /FO CSV /NH': { stdout: TASKLIST_SVC0 },
+    curl: curlResult,
+  });
+}
+/** win 无监听链 mock。 */
+function winNoListenerMock(curlResult) {
+  return makeExecMock({
+    [TOOL_PROBE_KEY]: TOOL_PROBE_OK,
+    'netstat -ano': { stdout: NETSTAT_NONE },
+    curl: curlResult,
+  });
+}
+/** sc query/qc 异步孪生 mock（RUNNING + AUTO_START）。 */
+function scRunningAsync() {
+  return async (cmd, args) => {
+    if (cmd === 'sc' && args[0] === 'query') return { ok: true, status: 0, stdout: 'STATE : 4 RUNNING', stderr: '', error: null };
+    if (cmd === 'sc' && args[0] === 'qc') return { ok: true, status: 0, stdout: 'START_TYPE : 2 AUTO_START', stderr: '', error: null };
+    throw Object.assign(new Error('unexpected ' + cmd), { code: 'UNMOCKED_PSVC' });
+  };
+}
+
+/** POSIX 服务检测孪生 mock（与 platform-service 平台分发同源）：linux `systemctl is-active/is-enabled`；
+ *  darwin `launchctl list`。state='running'|'stopped'——win 侧仍走 scRunningAsync（原样，不动）。
+ *  输出对齐解析契约：parseSystemdActive 认 status 0 + 'active'/'inactive'（'inactive' = 已装未运行）。 */
+function posixServiceMock(state) {
+  return async (cmd, args) => {
+    if (cmd === 'launchctl' && args[0] === 'list') {
+      return { ok: true, status: 0, stdout: state === 'running' ? '4242 0 dsh-web' : '- 0 dsh-web', stderr: '', error: null };
+    }
+    if (cmd === 'systemctl' && args[0] === 'is-active') {
+      return { ok: true, status: 0, stdout: (state === 'running' ? 'active' : 'inactive') + '\n', stderr: '', error: null };
+    }
+    if (cmd === 'systemctl' && args[0] === 'is-enabled') {
+      return { ok: true, status: 0, stdout: 'enabled\n', stderr: '', error: null };
+    }
+    throw Object.assign(new Error('unexpected ' + cmd), { code: 'UNMOCKED_PSVC' });
+  };
+}
+/** 服务「存在且在跑」的平台分发选择器：win 原样返回 scRunningAsync()；POSIX 走对应后端命令形态。 */
+function runningServiceMock() {
+  return process.platform === 'win32' ? scRunningAsync() : posixServiceMock('running');
+}
+
+/** POSIX 真实探测夹具：临时目录自建可执行文件 + PATH 前置（经 runProbe/runProbeAsync 的 env 参数注入），
+ *  用于验证真实 spawn 通道的成功/非 0 退出映射，而**不依赖发行版装了哪些工具**（which/curl 的有无不作前提）。
+ *  仅 POSIX 分支调用（shell 脚本 + ':' 分隔符语义），win32 分支保持原样。 */
+function makeProbeStub(name, body) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-sys-probe-'));
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, '#!/bin/sh\n' + body, { mode: 0o755 });
+  fs.chmodSync(file, 0o755);
+  return {
+    env: Object.assign({}, process.env, { PATH: dir + path.delimiter + process.env.PATH }),
+    cleanup() { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 清理失败不掩盖断言结果 */ } },
+  };
+}
+
+function teardownProbeMocks() {
+  sys.__setProbeExecutor(null);
+  psvc.__setProbeAsync(null);
+  sys.__resetNetBreaker();
+  delete process.env.DSH_PE_NET_BREAKER;
+}
+
+test('SYS-06 runProbe 同步契约回归：白名单拒绝/真实快速探测，且不返回 Promise', () => {
+  const r1 = sys.runProbe('not-allowed-cmd', [], undefined);
+  assert.equal(r1.ok, false);
+  assert.equal(r1.code, 'BAD_PROBE_CMD');
+  assert.ok(!(r1 instanceof Promise), 'runProbe 必须保持同步形态（重启阶梯链 svcStateRaw 等依赖）');
+
+  const r2 = sys.runProbe('sc', ['query\x01bad'], undefined);
+  assert.equal(r2.code, 'BAD_PROBE_ARG');
+
+  if (process.platform === 'win32') {
+    const r3 = sys.runProbe('where', ['sc.exe'], undefined);
+    assert.equal(r3.ok, true, 'where sc.exe 应成功');
+  } else {
+    // POSIX：where 是 Windows 专有解析器——真实探测的期望语义就是「不可达」（ENOENT，而非抛异常）；
+    // 正向成功路径改用自建工具（PATH 前置）走同一条真实 spawnSync 通道，不依赖发行版自带工具。
+    const rw = sys.runProbe('where', ['sc.exe'], undefined);
+    assert.equal(rw.ok, false, 'Linux/macOS 上 where 不可达（Windows 专有解析器）');
+    assert.equal(rw.code, 'ENOENT', '不可达须映射为 ENOENT 而不是抛异常');
+    const stub = makeProbeStub('where', 'echo /stub/sc.exe\n');
+    try {
+      const r3 = sys.runProbe('where', ['sc.exe'], stub.env);
+      assert.equal(r3.ok, true, 'POSIX 真实 spawnSync 成功路径（自建工具经 PATH 解析）');
+      assert.equal(r3.code, 0, '成功须映射为退出码 0');
+      assert.equal(String(r3.stdout).trim(), '/stub/sc.exe', '真实 stdout 须原样回传');
+    } finally { stub.cleanup(); }
+  }
+});
+
+test('SYS-07 runProbeAsync：Promise 形状/白名单/非 0 退出映射对齐 spawnSync status 语义', async () => {
+  const p = sys.runProbeAsync('not-allowed-cmd', [], undefined);
+  assert.ok(p instanceof Promise);
+  const r1 = await p;
+  assert.deepEqual(r1, { ok: false, code: 'BAD_PROBE_CMD' });
+
+  // 真实执行器：非 0 退出 → {ok:false,code:<exit>}（spawnSync status 等价）
+  if (process.platform === 'win32') {
+    // win：where 存在但名字查不到 → 退出码 1
+    const r2 = await sys.runProbeAsync('where', ['dsh-definitely-not-exist-xyz-9x7'], undefined);
+    assert.equal(r2.ok, false);
+    assert.equal(r2.code, 1, '非 0 退出码必须映射为 number');
+  } else {
+    // POSIX：where 本身不可达 → ENOENT（string，非退出码）；「非 0 退出 → number」改由自建工具真实验证
+    const rw = await sys.runProbeAsync('where', ['dsh-definitely-not-exist-xyz-9x7'], undefined);
+    assert.equal(rw.ok, false);
+    assert.equal(rw.code, 'ENOENT', 'POSIX 无 where：不可达语义（string code，与退出码区分）');
+    const stub = makeProbeStub('where', 'exit 3\n');
+    try {
+      const r2 = await sys.runProbeAsync('where', [], stub.env);
+      assert.equal(r2.ok, false);
+      assert.equal(r2.code, 3, '非 0 退出码必须映射为 number');
+      assert.equal(typeof r2.code, 'number', '退出码不得退化为字符串');
+    } finally { stub.cleanup(); }
+  }
+
+  // ENOENT 映射（mock 注入，避免依赖白名单外命令）
+  sys.__setProbeExecutor(makeExecMock({
+    where: () => { throw Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }); },
+  }));
+  try {
+    const r3 = await sys.runProbeAsync('where', ['sc.exe'], undefined);
+    assert.deepEqual({ ok: r3.ok, code: r3.code }, { ok: false, code: 'ENOENT' });
+  } finally { teardownProbeMocks(); }
+});
+
+test('SYS-08 C-3 超时硬杀：挂起子进程被击杀 → ETIMEDOUT 且远短于命令自然时长', { timeout: 20000 }, async () => {
+  // 【挂起来源已换：黑洞地址 → 环回停滞服务】旧写法连 http://10.255.255.1/（黑洞地址）指望 connect 挂起，
+  // 实测**同一台机上就能翻脸**：直连该地址 3 次 = exit 28(5020ms) / exit 7(31ms) / exit 7(29ms)——
+  // 首连挂起、随后被邻居/路由缓存的下一条不可达秒回 EHOSTUNREACH ⇒ curl 秒退 7，探针根本等不到超时，
+  // 断言 code==='ETIMEDOUT' 随机变红（flaky；同文件连跑 3 次 = OK/FAIL/FAIL 即此因）。
+  // 换成本机停滞服务：端口由内核分配、必然处于 LISTEN、连接必被 accept，服务端只读不写 ⇒ curl 阻塞等响应
+  // 直到 -m 到点。不触网、不吃路由/代理/ICMP 的影响，挂起是**服务端行为**而非网络运气。
+  // 腿①走真实 curl 二进制 + 真实 spawn/杀进程链路（POSIX）；腿②③用执行器注入缝钉住归一化契约，
+  // 跨平台恒跑（形状取自本机实测：execFile 超时拒绝 = code:null / killed:true / signal:'SIGTERM'，
+  // 不带 'ETIMEDOUT' 字样——归一化读的是 killed/signal，不是某个平台特有的 code）。
+  const conns = [];
+  const srv = net.createServer((conn) => { conns.push(conn); /* 持有连接、永不写响应：就是挂起 */ });
+  await new Promise((res, rej) => { srv.once('error', rej); srv.listen(0, '127.0.0.1', res); });
+  const url = 'http://127.0.0.1:' + srv.address().port + '/';
+  // 探针环境剥掉代理变量 + --noproxy '*'：确保「连本机」不受宿主代理配置影响（本机代理命中与否不再是不确定项）
+  const probeEnv = Object.assign({}, process.env);
+  for (const k of ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'all_proxy']) delete probeEnv[k];
+  probeEnv.no_proxy = '*'; probeEnv.NO_PROXY = '*';
+  // 注：--noproxy 的值必须是白名单参数字符集（validateProbe 正则无 `*`）——写 '*' 会先被判 BAD_PROBE_ARG，
+  // 探针根本不执行 curl。这里用本机回环字面量，语义等价（只需豁免回环一条）。
+  const args = ['-s', '-m', '8', '--noproxy', '127.0.0.1', url]; // -m 8 = 自然时长 8s，远长于探针 700ms 硬超时
+  try {
+    if (process.platform !== 'win32') {
+      // 腿①（真实链路·证伪腿）：真实 curl 连本机停滞服务 → 挂起 → 探针 700ms 硬超时应击杀它
+      // 负控实证：抽掉 execOpts.timeout 后本腿在 ~8s 处红（elapsed<5000 断言），非永真。
+      const t0 = Date.now();
+      const r = await sys.runProbeAsync('curl', args, probeEnv, { timeoutMs: 700 });
+      const elapsed = Date.now() - t0;
+      assert.equal(r.ok, false);
+      assert.equal(r.code, 'ETIMEDOUT', '超时必须归一化为 ETIMEDOUT');
+      assert.ok(elapsed < 5000, '子进程必须在超时窗内被杀死（实际 ' + elapsed + 'ms；未击杀将 ≥8s）');
+    }
+    // 腿②（执行器契约）：真实超时拒绝形状 → 归一化 ETIMEDOUT，且硬超时确被透传给执行器
+    let seen = null;
+    sys.__setProbeExecutor(async (cmd, a, opts) => {
+      seen = { cmd, a, opts };
+      throw Object.assign(new Error('Command failed: timeout'), { code: null, killed: true, signal: 'SIGTERM', stdout: '', stderr: '' });
+    });
+    const r2 = await sys.runProbeAsync('curl', args, probeEnv, { timeoutMs: 700 });
+    assert.deepEqual({ ok: r2.ok, code: r2.code }, { ok: false, code: 'ETIMEDOUT' }, 'code=null + killed/signal 的超时拒绝必须归一化为 ETIMEDOUT');
+    assert.equal(seen.opts.timeout, 700, '探针硬超时必须透传到执行器（去掉超时处理本断言即红）');
+    // 腿③（反向对照·防永真）：非超时失败不得被误判为 ETIMEDOUT——exit 7 正是本缺陷的现场症状
+    sys.__setProbeExecutor(makeExecMock({ curl: CURL_EXIT7 }));
+    const r3 = await sys.runProbeAsync('curl', args, probeEnv, { timeoutMs: 700 });
+    assert.equal(r3.code, 7, 'curl 连不上（exit 7）必须原样透传为退出码，不得被当作 ETIMEDOUT');
+  } finally {
+    for (const c of conns) { try { c.destroy(); } catch { /* 连接已由对端销毁：无妨 */ } }
+    await new Promise((res) => srv.close(res));
+    teardownProbeMocks();
+  }
+});
+
+test('SYS-09 probeEnv golden 契约：mock 全链下 items 序/key 集/字段与同步版逐字段一致', async () => {
+  sys.__setProbeExecutor(winChainMock({ stdout: '200' }));
+  psvc.__setProbeAsync(runningServiceMock());
+  try {
+    const items = await sys.probeEnv('dsh-web', {}, {});
+    assert.deepEqual(items.map((i) => i.key), ['tools', 'net', 'port-mode', 'port-pid'], '数组序契约');
+
+    const [tools, net, portMode, portPid] = items;
+    // tools/net：无 level 字段（同步版形状）
+    assert.deepEqual(Object.keys(tools).sort(), ['detail', 'key', 'ok', 'warn']);
+    assert.deepEqual({ ok: tools.ok, warn: tools.warn, detail: tools.detail }, { ok: true, warn: false, detail: 'ok' });
+    assert.deepEqual(Object.keys(net).sort(), ['detail', 'key', 'ok', 'warn']);
+    assert.deepEqual({ ok: net.ok, warn: net.warn, detail: net.detail }, { ok: true, warn: false, detail: 'ok' });
+    // port 两项：带 level:'warn'
+    if (process.platform === 'win32') {
+      assert.deepEqual(Object.keys(portMode).sort(), ['detail', 'key', 'level', 'ok']);
+      assert.deepEqual({ ok: portMode.ok, level: portMode.level, detail: portMode.detail }, { ok: true, level: 'warn', detail: 'service' });
+      assert.deepEqual({ ok: portPid.ok, level: portPid.level, detail: portPid.detail }, { ok: true, level: 'warn', detail: '4242' });
+    } else {
+      // POSIX：3080 监听者由同步原语真实探测（dshPrimPortHolder，无可注入的 mock 缝）——用例前提是
+      // 本机 3080 空闲（CI runner 无 DSH 服务）→ 平台映射「服务存在但无监听」：port-mode=service-stopped、
+      // port-pid=no-listener，且失败态合同按定义带 warn:true（win 侧有监听者故为 ok 形态，形状契约仍逐字段断言）。
+      assert.deepEqual(Object.keys(portMode).sort(), ['detail', 'key', 'level', 'ok', 'warn']);
+      assert.deepEqual({ ok: portMode.ok, warn: portMode.warn, level: portMode.level, detail: portMode.detail }, { ok: false, warn: true, level: 'warn', detail: 'service-stopped' });
+      assert.deepEqual({ ok: portPid.ok, warn: portPid.warn, level: portPid.level, detail: portPid.detail }, { ok: false, warn: true, level: 'warn', detail: 'no-listener' });
+    }
+  } finally { teardownProbeMocks(); }
+});
+
+test('SYS-10 probeEnv 无监听→service-stopped；工具不可达早退形状逐字一致；单项异常不拖垮整表', async () => {
+  // 分支①：3080 无监听 + 服务存在（STOPPED）
+  sys.__setProbeExecutor(winNoListenerMock({ stdout: '200' }));
+  psvc.__setProbeAsync(process.platform === 'win32'
+    ? async () => ({ ok: true, status: 0, stdout: 'STATE : 1 STOPPED', stderr: '', error: null })
+    : posixServiceMock('stopped'));
+  try {
+    const items = await sys.probeEnv('dsh-web', {}, {});
+    const pm = items.find((i) => i.key === 'port-mode');
+    const pp = items.find((i) => i.key === 'port-pid');
+    assert.deepEqual(pm, { key: 'port-mode', ok: false, warn: true, detail: 'service-stopped', level: 'warn' });
+    assert.deepEqual(pp, { key: 'port-pid', ok: false, warn: true, detail: 'no-listener', level: 'warn' });
+  } finally { teardownProbeMocks(); }
+
+  // 分支②：工具解析命令非 0 退出 → 早退四项 tool-unreachable（含 level 字段）
+  sys.__setProbeExecutor(makeExecMock({
+    [TOOL_PROBE_KEY]: () => { throw Object.assign(new Error('exit 1'), { code: 1 }); },
+  }));
+  psvc.__setProbeAsync(async () => { throw new Error('must not be called'); });
+  try {
+    const items = await sys.probeEnv('dsh-web', {}, {});
+    assert.deepEqual(items.map((i) => i.key), ['tools', 'net', 'port-mode', 'port-pid']);
+    for (const it of items) {
+      assert.deepEqual(it, { key: it.key, ok: false, warn: true, level: 'warn', detail: 'tool-unreachable' }, '早退项形状逐字一致');
+    }
+  } finally { teardownProbeMocks(); }
+
+  // 分支③：单项执行器抛异常 → 该项降级 warn，其余项照常
+  sys.__setProbeExecutor(makeExecMock({
+    [TOOL_PROBE_KEY]: () => { throw new Error('boom'); },
+  }));
+  try {
+    const items = await sys.probeEnv('dsh-web', {}, {});
+    assert.deepEqual(items.map((i) => i.key), ['tools', 'net', 'port-mode', 'port-pid'], '异常不拖垮整表');
+  } finally { teardownProbeMocks(); }
+});
+
+test('SYS-11 net 熔断状态机：3 连败入冷却→窗内零实测回缓存+degraded 标注；成功清零；旋钮关闭', async () => {
+  // 阶段①：3 次连败全部实测，第 4 次起进冷却窗
+  const execFail = winChainMock(CURL_EXIT7);
+  sys.__setProbeExecutor(execFail);
+  psvc.__setProbeAsync(runningServiceMock());
+  try {
+    for (let i = 1; i <= 3; i++) {
+      const items = await sys.probeEnv('dsh-web', {}, {});
+      const net = items.find((x) => x.key === 'net');
+      assert.equal(net.detail, 'unreachable', '第 ' + i + ' 次连败仍实测');
+      assert.deepEqual(Object.keys(net).sort(), ['detail', 'key', 'ok', 'warn'], '失败态字段契约不变');
+    }
+    const curlCallsAfter3 = execFail.calls.filter((c) => c.startsWith('curl')).length;
+    assert.equal(curlCallsAfter3, 3);
+
+    // 第 4/5 次：冷却窗内不再实测（curl 计数冻结）、回缓存判定并标注 degraded
+    const r4 = await sys.probeEnv('dsh-web', {}, {});
+    const net4 = r4.find((x) => x.key === 'net');
+    assert.deepEqual({ ok: net4.ok, warn: net4.warn, detail: net4.detail }, { ok: false, warn: true, detail: 'unreachable+cooldown' });
+    assert.deepEqual(Object.keys(net4).sort(), ['detail', 'key', 'ok', 'warn'], '冷却项字段契约不变');
+    await sys.probeEnv('dsh-web', {}, {});
+    const curlCallsAfter5 = execFail.calls.filter((c) => c.startsWith('curl')).length;
+    assert.equal(curlCallsAfter5, 3, '冷却窗内零实测');
+  } finally { teardownProbeMocks(); }
+
+  // 阶段②：成功清零（在未入冷却的连败中途成功）——清零后再次两连败仍全部实测（fail 计数从 0 重计）
+  let succeedNext = false;
+  const execMix = winChainMock(() => (succeedNext ? { stdout: '200' } : CURL_EXIT7));
+  sys.__setProbeExecutor(execMix);
+  psvc.__setProbeAsync(runningServiceMock());
+  try {
+    await sys.probeEnv('dsh-web', {}, {}); // fail=1（实测）
+    succeedNext = true;
+    const okNet = (await sys.probeEnv('dsh-web', {}, {})).find((x) => x.key === 'net'); // 实测成功 → 清零
+    assert.deepEqual({ ok: okNet.ok, warn: okNet.warn, detail: okNet.detail }, { ok: true, warn: false, detail: 'ok' }, '成功即清零且回正常判定');
+    const curlAtOk = execMix.calls.filter((c) => c.startsWith('curl')).length;
+    assert.equal(curlAtOk, 2);
+    succeedNext = false;
+    // 清零后两次连败必须仍是实测（若未清零，这两次会是 fail=2、3——第二次就进冷却）
+    for (let i = 0; i < 2; i++) {
+      const items = await sys.probeEnv('dsh-web', {}, {});
+      assert.equal(items.find((x) => x.key === 'net').detail, 'unreachable', '清零后重计连败仍实测');
+    }
+    assert.equal(execMix.calls.filter((c) => c.startsWith('curl')).length, 4, '每次均为实测');
+  } finally { teardownProbeMocks(); }
+
+  // 阶段③：旋钮 DSH_PE_NET_BREAKER=0 —— 连败 5 次全部实测、永不标注 cooldown
+  process.env.DSH_PE_NET_BREAKER = '0';
+  const execKnob = winChainMock(CURL_EXIT7);
+  sys.__setProbeExecutor(execKnob);
+  psvc.__setProbeAsync(runningServiceMock());
+  try {
+    for (let i = 0; i < 5; i++) {
+      const items = await sys.probeEnv('dsh-web', {}, {});
+      assert.equal(items.find((x) => x.key === 'net').detail, 'unreachable', '旋钮关闭时每次都实测');
+    }
+    assert.equal(execKnob.calls.filter((c) => c.startsWith('curl')).length, 5, '旋钮关闭时无熔断计数');
+  } finally { teardownProbeMocks(); }
+}, { timeout: 30000 });
+
+test('SYS-12 形状防御断言（C-2 兜底）：probeEnv 返回 Promise、runProbe/runProbeAsync 双形态锁定', async () => {
+  sys.__setProbeExecutor(makeExecMock({
+    'where sc.exe': WHERE_OK,
+    'netstat -ano': { stdout: NETSTAT_NONE },
+    'tasklist /FO CSV /NH': { stdout: '' },
+    curl: { stdout: '000' },
+  }));
+  psvc.__setProbeAsync(async () => ({ ok: true, status: 0, stdout: 'STATE : 1 STOPPED', stderr: '', error: null }));
+  try {
+    const p = sys.probeEnv('dsh-web', {}, {});
+    assert.ok(p instanceof Promise, '漏网消费方拿到的是 Promise 而非数组——防御断言兜底');
+    const items = await p;
+    assert.ok(Array.isArray(items));
+
+    const syncR = sys.runProbe('nope', [], undefined);
+    assert.ok(!(syncR instanceof Promise) && typeof syncR === 'object', 'runProbe 保持普通对象返回');
+    const asyncR = sys.runProbeAsync('nope', [], undefined);
+    assert.ok(asyncR instanceof Promise, 'runProbeAsync 必须 Promise 化');
+    await asyncR;
+
+    // B1 扩展原语发射闭合：解析原语随 PORT_PRIMS 全量发射（生成脚本自包含纪律）
+    const prims = sys.scriptPortPrims();
+    assert.ok(prims.includes('var dshPrimParsePortHolder ='), '解析原语必须进入发射块');
+    assert.equal(typeof sys.portHolderPid, 'function');
+  } finally { teardownProbeMocks(); }
+});
+
+test('SYS-13 detectService 孪生 parity：同 mock 下 sync 与 async 结果逐字段一致', async () => {
+  if (process.platform !== 'win32') {
+    // 孪生分发按平台路由；跨平台孪生共享 parse* 纯函数（另有平台测试覆盖），此处仅验分发存在
+    assert.equal(typeof psvc.detectServiceAsync, 'function');
+    assert.ok(psvc.detectServiceAsync('svc-x', {}) instanceof Promise);
+    return;
+  }
+  // 场景①：RUNNING + AUTO_START → exists/enabled/detail 一致
+  let step = 0;
+  const outsRunning = [
+    { ok: true, status: 0, stdout: 'STATE : 4 RUNNING', stderr: '', error: null },
+    { ok: true, status: 0, stdout: 'START_TYPE : 2 AUTO_START', stderr: '', error: null },
+  ];
+  psvc.__setProbe(() => outsRunning[Math.min(step++, outsRunning.length - 1)]);
+  const syncRunning = psvc.win.detectService('svc-x', {});
+  step = 0;
+  psvc.__setProbeAsync(async () => outsRunning[Math.min(step++, outsRunning.length - 1)]);
+  const asyncRunning = await psvc.detectServiceAsync('svc-x', {});
+  assert.deepEqual(syncRunning, asyncRunning);
+  assert.deepEqual(syncRunning, { exists: true, enabled: true, detail: 'ok', tool: 'sc/reg/nssm' });
+
+  // 场景②：服务缺失 → missing 形状一致
+  step = 0;
+  const outsMissing = [{ ok: false, status: 1060, stdout: 'OPENSC FAILED 1060', stderr: '', error: null }];
+  psvc.__setProbe(() => outsMissing[Math.min(step++, outsMissing.length - 1)]);
+  const syncMissing = psvc.win.detectService('svc-x', {});
+  step = 0;
+  psvc.__setProbeAsync(async () => outsMissing[Math.min(step++, outsMissing.length - 1)]);
+  const asyncMissing = await psvc.detectServiceAsync('svc-x', {});
+  assert.deepEqual(syncMissing, asyncMissing);
+  assert.deepEqual(syncMissing, { exists: false, enabled: false, detail: 'missing', tool: 'sc/reg/nssm' });
+
+  psvc.__setProbe(null);
+  psvc.__setProbeAsync(null);
+});
+test('SYS-14 desktop 形态：port-mode=desktop、port-pid=本进程，且不探测 3080（v3.4.x 契约）', async () => {
+  // 桌面端 web 端口随机、无 nssm 服务概念：3080 探测会误判，必须整体跳过（holder=null）。
+  sys.__setDesktop(true);
+  sys.__setProbeExecutor(makeExecMock({
+    'where sc.exe': WHERE_OK,
+    'netstat -ano': { stdout: NETSTAT_NONE },
+    'tasklist /FO CSV /NH': { stdout: '' },
+    curl: { stdout: '200' },
+  }));
+  psvc.__setProbeAsync(runningServiceMock());
+  try {
+    const items = await sys.probeEnv('dsh-web', {}, {});
+    assert.deepEqual(items.map((i) => i.key), ['tools', 'net', 'port-mode', 'port-pid'], '桌面分支仍保持四元序');
+    const byKey = Object.fromEntries(items.map((i) => [i.key, i]));
+    assert.equal(byKey['port-mode'].detail, 'desktop', '桌面形态标注 desktop');
+    assert.equal(byKey['port-mode'].ok, true);
+    assert.equal(byKey['port-pid'].detail, String(process.pid), '桌面形态托管者是本进程');
+  } finally {
+    sys.__setDesktop(null);
+    teardownProbeMocks();
+  }
+});

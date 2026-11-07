@@ -1,0 +1,86 @@
+# 行尾归一（2026-09-26 立 · WSL 迁移时补）
+#
+# ## 为什么需要这个文件
+#
+# 本机 Windows 侧 git 系统级配置 core.autocrlf = true，而本仓此前**没有** .gitattributes
+# ⇒ git 自行决定哪些文件在工作区写成 CRLF。实测（prompt-enhancer，**132** 个受控文件；
+# 取数 `git ls-files | wc -l`）。**原记「131」= 本文件入册前一个 commit（`fe0aa40`）的读数**，
+# 本文件于 `2bd7dc5` 入册后为 132（取数 `git ls-tree -r --name-only <sha> | wc -l`；
+# 2026-09-26 复算：4446df1=130 / fe0aa40=131 / 2bd7dc5=132 / af9855c=132）：
+# 文本面：工作区与索引实测**都已是 LF**（`git ls-files --eol` 中 `w/crlf` = 0、`i/crlf` = 0）。
+# 另有 8 个**二进制件**（7 .png + 1 .ico）工作区实测含 CR 字节——那是下方 `binary` 属性
+# **主动保留原始字节**的结果，与「文本被写成 CRLF」是两件事（原记「工作区 8 个文件呈 CRLF」
+# 即此两事之混记，2026-09-26 订正）。
+#
+# 直接后果：同一棵工作树被 Windows git（autocrlf=true）与 WSL git（未设=false）
+# 以**不同规则**解读 ⇒ 在 WSL 侧 git status 显示大量"改动"，
+# 实为**视角差异而非内容漂移**。此**形态**在本仓仍可复现，判据 =「diff 增删行数相等」
+# 且「`--ignore-cr-at-eol` 后差异归零」（2026-09-26 复核实测 119 文件 +22540/-22540 且归零）
+# —— 可作为"零内容改动"的判据。
+#
+# ⚠ 下面两条**具体数字**只属历史观测，与上面的**形态判据**是两件事，勿混读：
+# · prompt-enhancer「16 文件 +5881/-5881」：**形态可复现、精确值不可复现**——本仓全部 404 个
+#   commit 中无一处命中该数对（2026-09-26 复算）。
+# · shoucang「74 文件 +25746/-25746」：**他仓历史观测，本仓不可核**（该仓从未登记
+#   .gitattributes；所引 commit `81501d5` 经复核为 not a valid object name；现读数相差一个
+#   数量级）⇒ 仅记录来源，**不具判据效力**。
+#
+# ## 本文件做什么
+#
+# 把"源文件一律 LF"从**偶然**变成**契约**：不论 core.autocrlf 如何设置、
+# 不论在 Windows/WSL/Linux 哪台机器上检出，工作区与索引都是 LF。
+#
+# ## 为什么它不改动既有内容（实测）
+#
+# eol=lf 只规定"检出时写成什么"，索引侧本就已是 LF
+# ⇒ 加本文件**不产生索引变更**。校验：加之前后 git status 只应显示本文件自身。
+#
+# ## 边界
+#
+# 二进制作显式 binary 声明（否则 git 可能改写字节 ⇒ 产物损坏）。
+# 本仓实测二进制受控文件：8 个（7 .png + 1 .ico）
+#
+# 默认：文本自动识别 + 检出为 LF
+* text=auto eol=lf
+
+# 显式固化源文件与文档类型（与上一条冗余，但让"这些必须是 LF"可被 grep 到，
+# 且不受未来 * 规则调整影响）
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.mjs   text eol=lf
+*.js    text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.jsonl text eol=lf
+*.md    text eol=lf
+*.css   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.py    text eol=lf
+*.sh    text eol=lf
+
+# PowerShell 脚本：本仓当前为 LF 且实测可用，固定之
+*.ps1   text eol=lf
+
+# 二进制件：禁止任何行尾转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.tgz   binary
+*.woff  binary
+*.woff2 binary
+*.m4a   binary
+*.mp3   binary
+*.mp4   binary
+*.wav   binary
+*.map   text eol=lf
+
+# 例外：*.txt 按文本处理会弄坏含 NUL 的抓取日志；
+# git 的 text=auto 本会把含 NUL 者判为二进制，这里显式收窄。
+*.txt   text=auto

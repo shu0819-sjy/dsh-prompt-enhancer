@@ -1,0 +1,409 @@
+'use strict';
+// 批次二（B1 + A4）维护/救援体系契约测试。
+// 覆盖：sys 端口原语集（含源码嵌入形态）、stage-install 抽取面、maintain-lib
+// （干跑三层 CJS 版/装配面改写/指认/决策纯函数）、进程计时层、rescue 快照回滚、一键更新（安装侧）。
+//
+// 2026-09-13（用户指令·移除插件内重启能力）——以下用例的受测对象已随重启/救援链删除，整段移除：
+//   MAINT-19 buildPortRestartScript / buildServiceRestartScript（脚本生成器）、
+//   MAINT-21 acquireRescueLock / releaseRescueLock（救援互斥锁）、
+//   MAINT-23 / MAINT-24 svcStateRaw（服务状态解析）、
+//   MAINT-25a~25p / 25s / 25t / 25u / 25w ensureWebUp 阶梯与确认门 / restartService 预检、
+//   MAINT-25r waitWebReady、MAINT-26 buildWebMenuCmdBody（菜单壳生成器）、
+//   MAINT-26b killConflictingHolders、MAINT-26d pickRestartMode。
+//   保留（受测对象仍在）：MAINT-20（buildCliRestartScript 退役断言——正是「不得复活」守卫）、
+//   MAINT-25q（createTimedIo / runWithTiming 进程计时层）、MAINT-26c（runOneClickUpdate，按新契约改写）。
+//
+// 挂起根因（本次修复·全量 npm test 曾 300s 超时）：MAINT-25r 先 `const srv = net.createServer()`
+//   监听动态口，随后 `await updater.waitWebReady(...)`——waitWebReady 已随重启链删除 ⇒ 该行抛
+//   TypeError，其后的 `srv.close()` 永不执行，仍处于 listening 的 server 句柄把 node --test 的
+//   测试文件子进程永久吊住（测试早已全部跑完/失败，进程却不退出）。删掉该用例即消除挂起；
+//   其余用例的抛错都不持有存活句柄（25m 的未 await promise 无句柄）。
+//
+// 隔离纪律：所有落盘用例走临时目录；require index.cjs 前置 DSH_ENHANCER_NO_INDEX=1
+// 防 20s 兜底把真实进程索引污染成测试进程（2026-08-22 实测坑）。
+process.env.DSH_ENHANCER_NO_INDEX = '1';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync, spawn } = require('node:child_process');
+const net = require('node:net');
+
+const sys = require('../lib/sys.cjs');
+const M = require('../lib/maintain-lib.cjs');
+const stageInstall = require('../lib/stage-install.cjs');
+const updater = require('../lib/updater-host.cjs');
+const indexMod = require('../lib/index.cjs');
+
+const tmpRoot = () => fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-maint-'));
+
+/* ---------------- B1：端口原语集 ---------------- */
+
+test('MAINT-01 scriptPortPrims 全量发射且组合脚本能通过 node --check', () => {
+  const src = sys.scriptPortPrims();
+  for (const name of ['dshPrimNetstat', 'dshPrimPortHolder', 'dshPrimTaskKill', 'dshPrimPidImage', 'dshPrimPidHasListening']) {
+    assert.ok(src.includes('var ' + name + ' ='), '缺原语: ' + name);
+  }
+  // 自包含纪律：嵌入函数体不得引用宿主模块闭包（剥离注释行后校验，防文档字样误报）
+  const codeOnly = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+  assert.ok(!/[^.\w]sys\./.test(codeOnly), '原语体内不得引用 sys.*');
+  const script = src + '\nconsole.log(typeof dshPrimPortHolder === "function" ? "ok" : "bad");\n';
+  const f = path.join(tmpRoot(), 'composed.cjs');
+  fs.writeFileSync(f, script, 'utf8');
+  const r = spawnSync(process.execPath, [f], { encoding: 'utf8', timeout: 15000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), 'ok');
+});
+
+test('MAINT-02 portHolderPid 探测真实监听者（本进程临时监听）', () => {
+  return new Promise((resolve) => {
+    const srv = net.createServer(() => {});
+    srv.listen(0, '127.0.0.1', () => {
+      const port = srv.address().port;
+      assert.equal(sys.portHolderPid(port), process.pid);
+      srv.close(() => {
+        // 关闭后同口应探测不到（容忍 TIME_WAIT 内偶发复用，重试几次取稳定值）
+        let tries = 0;
+        const poll = () => {
+          if (sys.portHolderPid(port) === 0 || ++tries > 5) {
+            if (tries <= 5) assert.equal(sys.portHolderPid(port), 0);
+            resolve();
+          } else setTimeout(poll, 200);
+        };
+        setTimeout(poll, 300);
+      });
+    });
+  });
+});
+
+test('MAINT-03 killPortHolder 按端口清理外部监听进程并确认退出', () => {
+  return new Promise((resolve) => {
+    const holder = path.join(tmpRoot(), 'holder.js');
+    // 子进程监听动态口并把实际端口号写旁挂文件（父进程据此调用 killPortHolder）
+    fs.writeFileSync(holder, [
+      "const net=require('node:net');const fs=require('node:fs');",
+      "const srv=net.createServer(()=>{});",
+      "srv.listen(0,'127.0.0.1',()=>{fs.writeFileSync(__filename+'.port', String(srv.address().port)); setInterval(()=>{},1000);});",
+    ].join('\n'), 'utf8');
+    const child = spawn(process.execPath, [holder], { stdio: 'ignore' });
+    const portFile = holder + '.port';
+    const waitPort = (n) => {
+      if (!fs.existsSync(portFile)) {
+        if (n > 50) { child.kill('SIGKILL'); return resolve(assert.fail('子进程未就绪')); }
+        return setTimeout(() => waitPort(n + 1), 100);
+      }
+      const port = Number(fs.readFileSync(portFile, 'utf8').trim());
+      sys.killPortHolder(port, {}).then((r) => {
+        assert.equal(r.ok, true);
+        assert.ok(r.killed);
+        assert.equal(r.pid, child.pid);
+        const gone = () => {
+          try { process.kill(child.pid, 0); setTimeout(gone, 200); } catch (e) {
+            assert.notEqual(e.code, 'EPERM');
+            resolve();
+          }
+        };
+        setTimeout(gone, 300);
+      });
+    };
+    waitPort(0);
+  });
+});
+
+test('MAINT-04 killPortHolder 身份门：expectImage 不命中即拒杀', async () => {
+  const srv = net.createServer(() => {});
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+  const r = await sys.killPortHolder(port, { expectImage: /definitely-not-a-real-image/i });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'IDENTITY_MISMATCH');
+  srv.close();
+});
+
+test('MAINT-05 waitPidExit：已退出 pid 返回 true', async () => {
+  const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { stdio: 'ignore' });
+  await new Promise((r) => setTimeout(r, 300));
+  child.kill('SIGKILL');
+  const gone = await sys.waitPidExit(child.pid, 5000);
+  assert.equal(gone, true);
+});
+
+/* ---------------- 决策纯函数（G5/G6）---------------- */
+
+test('MAINT-06 compareSemver / decideUpdateAction 方向门矩阵', () => {
+  assert.equal(M.compareSemver('3.3.1', '3.4.0'), -1);
+  assert.equal(M.compareSemver('v3.3.1', '3.3.1'), 0);
+  assert.equal(M.compareSemver('3.10.0', '3.9.9'), 1);
+  assert.equal(M.compareSemver('', null), null);
+  assert.deepEqual(
+    [M.decideUpdateAction('3.4.0', '3.3.1').action,
+     M.decideUpdateAction('3.3.1', '3.3.1').action,
+     M.decideUpdateAction('3.3.1', '3.4.0').action,
+     M.decideUpdateAction(null, '3.4.0').action],
+    ['confirm-downgrade', 'confirm-equal', 'proceed', 'confirm'],
+  );
+});
+
+test('MAINT-07 isDshFamilyImage 家族判定（G6）', () => {
+  assert.equal(M.isDshFamilyImage('DSH Desktop.exe'), true);
+  assert.equal(M.isDshFamilyImage('node.exe'), true);
+  assert.equal(M.isDshFamilyImage('node'), true);
+  assert.equal(M.isDshFamilyImage('chrome.exe'), false);
+  assert.equal(M.isDshFamilyImage(''), false);
+});
+
+/* ---------------- 干跑三层（CJS 单一事实源）---------------- */
+
+test('MAINT-08 extractEntryNames 保守口径（含 / 才收）+ 裸包名经 extraNames 补录', () => {
+  const dump = [
+    'plugins:',
+    '  - name: "@deepseek-ai/dsh-base"',
+    "  - name: 'some-pkg'",
+    '  - name: bare-name/x',
+    '  - name: !!js/function "ctx.something"',
+    '  - name: ctx.expression.no',
+    '  - id: not-a-name',
+  ].join('\n');
+  const names = M.extractEntryNames(dump);
+  assert.ok(names.includes('@deepseek-ai/dsh-base'));
+  assert.ok(names.includes('bare-name/x'));
+  // 保守口径：无 scope 分隔的裸名不收（dump 可能混有其他 name: 键，宁漏勿误杀好安装）——
+  // dshmarket 类裸包名由调用方从 profile package.json 经 dryRunAll extraNames 显式补录。
+  assert.ok(!names.includes('some-pkg'));
+  assert.ok(!names.some((n) => n.includes('ctx.')));
+});
+
+test('MAINT-09 resolveProbe 双根解析（存在命中 / 缺失报错）', () => {
+  const root = tmpRoot();
+  fs.mkdirSync(path.join(root, 'node_modules', 'fake-pkg'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"root"}', 'utf8');
+  fs.writeFileSync(path.join(root, 'node_modules', 'fake-pkg', 'package.json'), '{"name":"fake-pkg","main":"index.js"}', 'utf8');
+  fs.writeFileSync(path.join(root, 'node_modules', 'fake-pkg', 'index.js'), 'module.exports=1;', 'utf8');
+  const r = M.resolveProbe(['fake-pkg', 'missing-dep-pkg'], [root]);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.missing.map((m) => m.name), ['missing-dep-pkg']);
+  assert.deepEqual(M.resolveProbe(['fake-pkg'], [root]).missing, []);
+});
+
+test('MAINT-10 dryRunRoots：profile 根在、其余根（如安装根）可缺且全部存在', () => {
+  const home = tmpRoot();
+  fs.mkdirSync(path.join(home, 'profiles', 'webx'), { recursive: true });
+  const roots = M.dryRunRoots(home, 'webx');
+  assert.ok(roots.length >= 1);
+  assert.ok(roots[0].endsWith('webx'));
+  for (const r of roots) assert.ok(fs.existsSync(r), '每个根都必须真实存在: ' + r);
+});
+
+/* ---------------- 装配面读取与改写（救援处置）---------------- */
+
+function fixtureProfile() {
+  const pp = M.profilePaths(tmpRoot(), 'web');
+  fs.mkdirSync(pp.dir, { recursive: true });
+  fs.writeFileSync(pp.packageJson, JSON.stringify({
+    name: 'p', dependencies: { 'bad-host': '^1', '@deepseek-ai/dsh-base': '*' },
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'good-plugin', 'bad-host'] } },
+  }), 'utf8');
+  fs.writeFileSync(pp.patchYml, '# header comment\n[]\n', 'utf8');
+  return pp;
+}
+
+test('MAINT-11 patch 三操作：append / readIds / 全量重写幂等', () => {
+  const pp = fixtureProfile();
+  M.appendDisableEntry(pp.patchYml, 'good-plugin');
+  assert.deepEqual(M.readPatchIds(pp.patchYml), ['good-plugin']);
+  M.appendDisableEntry(pp.patchYml, 'bad-host');
+  assert.deepEqual(M.readPatchIds(pp.patchYml), ['good-plugin', 'bad-host']);
+  M.writeDisableEntries(pp.patchYml, ['a-b', 'c-d']);   // 二分每轮重建（覆盖语义）
+  assert.deepEqual(M.readPatchIds(pp.patchYml), ['a-b', 'c-d']);
+  M.writeDisableEntries(pp.patchYml, []);               // 清空恢复 []
+  assert.deepEqual(M.readPatchIds(pp.patchYml), []);
+  assert.ok(fs.readFileSync(pp.patchYml, 'utf8').includes('[]'));
+});
+
+test('MAINT-12 removeBundle 只动 bundles 数组且保留 dependencies（只禁不删）', () => {
+  const pp = fixtureProfile();
+  const r = M.removeBundle(pp.packageJson, 'bad-host');
+  assert.equal(r.ok, true);
+  const pkg = JSON.parse(fs.readFileSync(pp.packageJson, 'utf8'));
+  assert.deepEqual(pkg.dsh.profile.bundles, ['@deepseek-ai/dsh-base', 'good-plugin']);
+  assert.ok(pkg.dependencies['bad-host'], '依赖声明必须保留（救援纪律一）');
+  assert.equal(M.removeBundle(pp.packageJson, 'no-such').ok, false);
+});
+
+test('MAINT-13 bundleList / thirdPartyBundles / isOfficialBase', () => {
+  const pp = fixtureProfile();
+  const pkg = M.readProfilePackage(pp);
+  assert.deepEqual(M.bundleList(pkg).length, 3);
+  assert.deepEqual(M.thirdPartyBundles(pkg), ['good-plugin', 'bad-host']);
+  assert.equal(M.isOfficialBase('@deepseek-ai/x'), true);
+  assert.equal(M.isOfficialBase('dshmarket'), false);
+});
+
+/* ---------------- 元凶指认（G12）---------------- */
+
+test('MAINT-14 scanCulprits 提取缺失模块/语法错误/duplicate 症状', () => {
+  const log = [
+    'Error: Cannot find module \'schemastery\'',
+    "ERR_MODULE_NOT_FOUND: Cannot find module 'foo/bar'",
+    'SyntaxError: Unexpected token in JSON',
+    'duplicate plugin id detected',
+  ].join('\n');
+  const c = M.scanCulprits(log);
+  assert.deepEqual(c.modules, ['schemastery', 'foo/bar']);
+  assert.ok(c.syntaxErrors.length >= 1);
+  assert.equal(c.duplicate, true);
+});
+
+test('MAINT-15 mapCulpritToBundles 定位声明依赖的宿主包（指认名≠禁用名）', () => {
+  const pp = fixtureProfile();
+  for (const name of ['good-plugin', 'bad-host']) {
+    const dir = path.join(pp.dir, 'node_modules', name);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'package.json'),
+      JSON.stringify(name === 'bad-host'
+        ? { name, dependencies: { schemastery: '^1' } }
+        : { name, dependencies: { unrelated: '*' } }), 'utf8');
+  }
+  const pkg = M.readProfilePackage(pp);
+  assert.deepEqual(M.mapCulpritToBundles('schemastery', pp, pkg), ['bad-host']);
+  assert.deepEqual(M.mapCulpritToBundles('totally-other', pp, pkg), []);
+  // 包目录整体缺失的 bundle 条目 = 直接嫌疑
+  assert.ok(M.mapCulpritToBundles('anything', pp, pkg).includes('good-plugin') === false);
+});
+
+/* ---------------- 快照回滚底座（A5/A6 配套）---------------- */
+
+test('MAINT-16 rescueSnapshot → 破坏 → rescueRestore 忠实回写（含 exactHomePatch 删除语义）', () => {
+  const home = tmpRoot();
+  const profileName = 'webt';
+  const profileDir = path.join(home, 'profiles', profileName);
+  fs.mkdirSync(profileDir, { recursive: true });
+  fs.writeFileSync(path.join(profileDir, 'package.json'), '{"orig":true}', 'utf8');
+  fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), '[]\n', 'utf8');
+  const runtimeDir = path.join(profileDir, 'node_modules', 'dsh-prompt-enhancer');
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, 'plugin-host.js'), '// original host', 'utf8');
+  const root = path.join(home, 'rescue');
+  const snap = sys.rescueSnapshot({ dshHome: home, profileName, runtimeDir, root, reason: 'test' });
+  assert.equal(snap.ok, true);
+
+  // 破坏现场
+  fs.writeFileSync(path.join(profileDir, 'package.json'), '{"broken":1}', 'utf8');
+  fs.writeFileSync(path.join(runtimeDir, 'plugin-host.js'), '// corrupted', 'utf8');
+  fs.writeFileSync(path.join(home, 'cordis.patch.yml'), '- bogus\n', 'utf8'); // 快照期不存在的新污染
+
+  const rb = sys.rescueRestore(snap.dir, { home, profileName, runtimeDir });
+  assert.equal(rb.ok, true);
+  assert.equal(fs.readFileSync(path.join(profileDir, 'package.json'), 'utf8'), '{"orig":true}');
+  assert.equal(fs.readFileSync(path.join(runtimeDir, 'plugin-host.js'), 'utf8'), '// original host');
+  // exactHomePatch=false：新污染被警告但不动手
+  assert.ok(rb.warnings.some((w) => w.includes('home-cordis.patch.yml')));
+  assert.ok(fs.existsSync(path.join(home, 'cordis.patch.yml')));
+  // exactHomePatch=true：忠实删除快照期不存在的文件
+  const rb2 = sys.rescueRestore(snap.dir, { home, profileName, runtimeDir, exactHomePatch: true });
+  assert.equal(rb2.ok, true);
+  assert.ok(!fs.existsSync(path.join(home, 'cordis.patch.yml')));
+});
+
+/* ---------------- stage-install 抽取面与 G5 探针 ---------------- */
+
+test('MAINT-17 update/install 与 stage-install 同一实现（杜绝逻辑分叉）', () => {
+  assert.equal(indexMod.installStagedTarball, stageInstall.installStagedTarball);
+  assert.equal(indexMod.findStagedTarball, stageInstall.findStagedTarball);
+  // 2026-09-13：原 update/portRestart（安装+重启）已拆成非重启的 update/install——
+  // 新 RPC 必须复用 lib/stage-install.cjs 同一实现，且重启 RPC 不得残留。
+  const src = fs.readFileSync(path.join(__dirname, '..', 'lib', 'index.cjs'), 'utf8');
+  assert.match(src, /harness\.handle\('update\/install'/, '新安装 RPC 必须注册');
+  // 只锚「注册」形态：注释里的说明性提及不算残留接线
+  assert.ok(!/harness\.handle\('update\/portRestart'/.test(src), '已移除的重启 RPC 不得残留注册');
+  assert.match(src, /installStagedTarball\(staged, profile\)/, 'update/install 必须调用 stage-install 的同一实现');
+  assert.match(src, /findStagedTarball\(\)/, 'update/install 必须复用同一 staging 发现实现');
+});
+
+test('MAINT-18 peekTarballVersion 缺失文件返回空串不抛', () => {
+  assert.equal(stageInstall.peekTarballVersion('C:\\definitely\\missing.tgz'), '');
+});
+
+test('MAINT-20 buildCliRestartScript 已随 G4 退役', () => {
+  assert.equal(indexMod.buildCliRestartScript, undefined);
+});
+
+test('MAINT-22 snapshotCleanCandidates 脏/干净分类（G16b）', () => {
+  const root = path.join(tmpRoot(), 'rescue');
+  const dirty = path.join(root, '20260822-000001');
+  const clean = path.join(root, '20260822-000002');
+  fs.mkdirSync(dirty, { recursive: true });
+  fs.mkdirSync(clean, { recursive: true });
+  fs.writeFileSync(path.join(dirty, 'profile-package.json'), '"bad-host"', 'utf8');
+  fs.writeFileSync(path.join(clean, 'profile-package.json'), '"good-only"', 'utf8');
+  const cands = M.thirdPartyBundles && snapshotClean(root, ['bad-host']);
+  assert.equal(cands.dirty.length, 1);
+  assert.equal(cands.clean.length, 1);
+  function snapshotClean(r, suspects) {
+    // 直接驱动内部实现等价物：读目录分类
+    const all = fs.readdirSync(r).sort().reverse().map((d) => {
+      const dir = path.join(r, d);
+      let text = '';
+      for (const f of ['profile-package.json', 'profile-cordis.patch.yml', 'home-cordis.patch.yml']) {
+        try { text += '\n' + fs.readFileSync(path.join(dir, f), 'utf8'); } catch { /* ignore */ }
+      }
+      return { dir, dirty: suspects.some((s) => text.includes(s)), reason: '' };
+    });
+    return { dirty: all.filter((c) => c.dirty), clean: all.filter((c) => !c.dirty) };
+  }
+});
+
+// v4.9（2026-08-23 端口重启事故回归）：仓库清单带 UTF-8 BOM 会使 DSH 启动 JSON.parse
+// 直接崩溃（Unexpected token '\ufeff'）——本用例守住 package.json 永远无 BOM。
+test('PKG-BOM package.json 禁止 UTF-8 BOM（启动崩溃根因回归守卫）', () => {
+  const b = fs.readFileSync(path.join(__dirname, '..', 'package.json'));
+  const hasBom = b.length >= 3 && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf;
+  assert.equal(hasBom, false, 'package.json 带 UTF-8 BOM（EF BB BF）——DSH 启动解析会崩溃');
+});
+
+const silentIo = () => ({ out() {}, ask: async () => '' });
+
+test('MAINT-25q 过程计时：timed io 每行带 [+Xs] 戳 + runWithTiming 开始/总耗时收尾', async () => {
+  const outs = []; const ticks = [];
+  const base = { out: (s) => outs.push(String(s)), tick: (l) => ticks.push(String(l)), clearTick: () => {} };
+  const tio = updater.createTimedIo(base);
+  tio.out('步骤A');
+  assert.ok(/^\[\d+s\] 步骤A$/.test(outs[outs.length - 1]), '输出应自动带耗时戳');
+  tio.tick('等待中');
+  assert.ok(/^\[\d+s\] 等待中$/.test(ticks[ticks.length - 1]), 'tick 应透传并带戳');
+  const r = await updater.runWithTiming(base, '测试动作', async (io2) => { io2.out('内部行'); return { ok: true }; });
+  assert.equal(r.ok, true);
+  assert.ok(outs.some((x) => x.includes('▶ 开始：测试动作')), '应打印开始行');
+  assert.ok(outs.some((x) => x === '[0s] 内部行' || /^\[\d+s\] 内部行$/.test(x)), '内部行应经包装输出');
+  assert.ok(outs.some((x) => x.includes('■ 结束：测试动作（总耗时 ') && x.endsWith('s）')), '应打印总耗时行');
+});
+
+test('MAINT-26c 一键更新（安装侧）：安装→干跑闸门，装完须手动重启；闸门失败自动回滚', async () => {
+  const seq = [];
+  const okRun = await updater.runOneClickUpdate(silentIo(), 'web', {
+    findTgzImpl: () => 'C:\\staged\\pkg.tgz',
+    peekVerImpl: () => '9.9.9',
+    curVerImpl: () => '3.3.1',
+    installImpl: async () => { seq.push('install'); return { ok: true, snapshotDir: 'C:\\snap\\x' }; },
+    gateImpl: async () => { seq.push('gate'); return { ok: true }; },
+  });
+  // 2026-09-13：终态不再是 UPDATED（重启能力已移除）—— 只安装并就位，交用户手动重启
+  assert.equal(okRun.code, 'INSTALLED_NEEDS_MANUAL_RESTART');
+  assert.equal(okRun.needsManualRestart, true, '一律如实报告需用户手动重启');
+  assert.deepEqual([okRun.from, okRun.to], ['3.3.1', '9.9.9']);
+  assert.deepEqual(seq, ['install', 'gate'], '只安装+过闸，不再杀旧进程/拉起服务/重启后自检');
+
+  // 闸门失败 → 自动快照回滚（既有语义不变；快照目录缺失时回滚如实失败但绝不抛出）
+  const rolled = await updater.runOneClickUpdate(silentIo(), 'web', {
+    findTgzImpl: () => 'C:\\staged\\bad.tgz',
+    peekVerImpl: () => '9.9.9',
+    curVerImpl: () => '3.3.1',
+    installImpl: async () => ({ ok: true, snapshotDir: 'C:\\snap\\y' }),
+    gateImpl: async () => ({ ok: false, layer: 'resolve', detail: 'missing x' }),
+    oldPidOverride: 0,
+  });
+  assert.equal(rolled.ok, false);
+  assert.equal(rolled.code, 'GATE_FAILED_ROLLED_BACK');
+  assert.equal(rolled.detail, 'missing x');
+});

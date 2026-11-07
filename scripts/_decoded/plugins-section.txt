@@ -1,0 +1,234 @@
+function PluginsSection(props) {
+  const t = makeT(props);
+  const [plugins, setPlugins] = React.useState(null);
+  const [error, setError] = React.useState(null);
+  const [busy, setBusy] = React.useState(null);
+  const [approvals, setApprovals] = React.useState(null);
+  const [logsOpen, setLogsOpen] = React.useState(false);
+  const [logs, setLogs] = React.useState(null);
+  // v2.4.3：版本选择与确认切换——选中非当前版本时显示「当前 → 目标」核对行，确认后执行 update
+  const [selVersion, setSelVersion] = React.useState({});
+  // 2026-08-16（方案「设置界面样式与交互对齐官方」）：版本下拉 label htmlFor 关联（稳定 id）
+  const versionId = React.useState(() => dshEnhId('dsh-plg-version'))[0];
+
+  const sessionId = props.useSessions ? props.useSessions((s) => s.current) : undefined;
+
+  const loadLogs = React.useCallback(() => {
+    host.call('logs/last').then((res) => {
+      const r = res && typeof res === 'object' ? res : {};
+      if (r.ok && Array.isArray(r.lines)) setLogs(r.lines);
+      else setLogs([]);
+    }).catch(() => setLogs([]));
+  }, []);
+
+  const toggleLogs = () => {
+    const next = !logsOpen;
+    setLogsOpen(next);
+    if (next && logs === null) loadLogs();
+  };
+
+  const load = React.useCallback(() => {
+    if (sessionId === undefined) return;
+    host.call('plugins/inventory', { sessionId }).then((res) => {
+      const r = res && typeof res === 'object' ? res : {};
+      if (r.ok && Array.isArray(r.plugins)) {
+        setPlugins(r.plugins);
+        setError(null);
+      } else {
+        setError(r.message || t('pluginsLoadFailed'));
+      }
+    }).catch(() => {
+      setError(t('pluginsLoadFailed'));
+    });
+  }, [sessionId]);
+
+  React.useEffect(() => { load(); }, [load]);
+
+  React.useEffect(() => {
+    if (!dynFace || typeof dynFace.activeRuns !== 'object') return;
+    const sync = () => {
+      setApprovals(new Map(dynFace.activeRuns.getSnapshot()));
+    };
+    sync();
+    return dynFace.activeRuns.subscribe(sync);
+  }, []);
+
+  const act = (action, pluginId, extra) => {
+    const key = pluginId + ':' + action;
+    setBusy(key);
+    setError(null);
+    const args = { sessionId, pluginId };
+    if (extra) Object.assign(args, extra);
+    host.call('plugins/' + action, args).then((res) => {
+      const r = res && typeof res === 'object' ? res : {};
+      if (!r.ok) setError((r.message ? r.message + ' ' : '') + t('pluginsActionFailed'));
+      load();
+    }).catch(() => {
+      setError(t('pluginsActionFailed'));
+    }).then(() => {
+      setBusy(null);
+    });
+  };
+
+  const approve = (requestId, future) => {
+    if (!dynFace) return;
+    dynFace.approve(requestId, future).catch(() => {});
+  };
+  const decline = (requestId) => {
+    if (!dynFace) return;
+    dynFace.decline(requestId).catch(() => {});
+  };
+
+  let content;
+  if (plugins === null) {
+    content = React.createElement('p', { className: 'dsh-plg-note' }, t('pluginsClientPending'));
+  } else if (plugins.length === 0) {
+    content = React.createElement('p', { className: 'dsh-plg-note' }, t('pluginsEmpty'));
+  } else {
+    const rows = plugins.map((p) => {
+      const stateText = t(stateKey(p.state));
+      const approval = approvals && approvals.get(p.pluginId);
+      const versions = (p.packages || []).map((pkg) => {
+        // v2.4.3-fix：残缺包（缺 host/client 半部）禁用并标注，防误切导致 UI 消失
+        const complete = pkg.hasHostHalf !== false && pkg.hasClientHalf !== false;
+        return React.createElement('option', {
+          key: pkg.packageId,
+          value: pkg.packageId,
+          disabled: !complete,
+        }, pkg.name + ' · ' + pkg.packageId + (complete ? '' : t('pluginsIncomplete')));
+      });
+      const running = p.activeRun !== undefined;
+      // v2.4.3：受控版本选择（缺省=当前版本）；选中非当前版本 → 显示核对行
+      const curId = p.currentPackageId || (p.packages && p.packages[0] && p.packages[0].packageId) || '';
+      const sel = selVersion[p.pluginId] || curId;
+      const switching = sel !== '' && sel !== curId;
+      const switchMode = p.currentPackageId ? 'update' : 'run';
+      return React.createElement('div', { key: p.pluginId, className: 'dsh-plg-card' },
+        React.createElement('div', { className: 'dsh-plg-head' },
+          React.createElement('span', { className: 'dsh-plg-name' }, p.pluginId + ' ' + p.name),
+          React.createElement('span', { className: 'dsh-plg-state' }, stateText),
+        ),
+        React.createElement('div', { className: 'dsh-plg-row' },
+          React.createElement('label', { className: 'dsh-plg-label', htmlFor: versionId + '-' + p.pluginId }, t('pluginsVersion')),
+          React.createElement(MarqueeSelect, {
+            id: versionId + '-' + p.pluginId,
+            className: 'dsh-plg-select',
+            value: sel,
+            onChange: (e) => setSelVersion({ ...selVersion, [p.pluginId]: e.target.value }),
+          }, versions),
+        ),
+        p.currentPackageId
+          ? React.createElement('div', { className: 'dsh-plg-row' },
+              React.createElement('span', { className: 'dsh-plg-label' }, t('pluginsCurrent')),
+              React.createElement('span', { className: 'dsh-plg-muted' }, p.currentPackageId),
+            )
+          : null,
+        // v2.4.3：切换确认行——展示当前版本与目标版本供核对，确认后 plugins/run（update）
+        switching
+          ? React.createElement('div', { className: 'dsh-plg-row dsh-plg-switch' },
+              React.createElement('span', { className: 'dsh-plg-muted' }, t('pluginsCurrent') + ' ' + (p.currentPackageId || '-')),
+              React.createElement('span', { className: 'dsh-plg-muted' }, '→'),
+              React.createElement('span', { className: 'dsh-plg-switch-target' }, t('pluginsTarget') + ' ' + sel),
+              React.createElement('button', {
+                type: 'button',
+                className: 'dsh-plg-btn dsh-plg-btn-primary',
+                disabled: busy !== null,
+                onClick: () => {
+                  act('run', p.pluginId, { packageId: sel, mode: switchMode });
+                  setSelVersion({ ...selVersion, [p.pluginId]: curId });
+                },
+              }, t('pluginsSwitch')),
+              React.createElement('button', {
+                type: 'button',
+                className: 'dsh-plg-btn',
+                disabled: busy !== null,
+                onClick: () => setSelVersion({ ...selVersion, [p.pluginId]: curId }),
+              }, t('cancel')),
+            )
+          : null,
+        (approval || p.pendingApproval)
+          ? React.createElement('div', { className: 'dsh-plg-row dsh-plg-approval' },
+              React.createElement('span', null, t('pluginsAwaiting')),
+              React.createElement('button', {
+                type: 'button',
+                className: 'dsh-plg-btn dsh-plg-btn-primary',
+                disabled: busy !== null,
+                onClick: () => approve(approval ? approval.requestId : undefined, false),
+              }, t('pluginsApproveOnce')),
+              approval
+                ? React.createElement('button', {
+                    type: 'button',
+                    className: 'dsh-plg-btn',
+                    disabled: busy !== null,
+                    onClick: () => decline(approval.requestId),
+                  }, t('pluginsDecline'))
+                : null,
+            )
+          : null,
+        React.createElement('div', { className: 'dsh-plg-actions' },
+          React.createElement('button', {
+            type: 'button',
+            className: 'dsh-plg-btn dsh-plg-btn-primary',
+            disabled: busy !== null,
+            onClick: () => {
+              if (running) act('stop', p.pluginId);
+              else act('run', p.pluginId, { packageId: p.currentPackageId || (p.packages && p.packages[0] && p.packages[0].packageId), mode: 'run' });
+            },
+          }, running ? t('pluginsStop') : t('pluginsRun')),
+          React.createElement('button', {
+            type: 'button',
+            className: 'dsh-plg-btn',
+            disabled: busy !== null,
+            onClick: () => act('undefine', p.pluginId),
+          }, t('pluginsRemove')),
+        ),
+      );
+    });
+    content = React.createElement(React.Fragment, null,
+      React.createElement('div', { className: 'dsh-plg-toolbar' },
+        React.createElement('button', {
+          type: 'button',
+          className: 'dsh-plg-btn',
+          disabled: busy !== null,
+          onClick: load,
+        }, t('pluginsRefresh')),
+        React.createElement('button', {
+          type: 'button',
+          className: 'dsh-plg-btn',
+          disabled: busy !== null,
+          onClick: toggleLogs,
+        }, t('cfgLogs')),
+      ),
+      rows,
+    );
+  }
+
+  return React.createElement('div', { className: 'dsh-plg-root' },
+    // v3.2.1-j（用户确认·UI 回滚）：UpdaterCard 放回插件管理 tab 原位置（插件清单上方）——
+    // 解耦只保留逻辑层（updaterCfgState 独立配置），UI 布局恢复原状。
+    React.createElement(UpdaterCard, props),
+    // 2026-08-18（用户需求）：项目地址跳转链接——版本检测与更新下方另起一行
+    React.createElement('div', { className: 'dsh-plg-project-link' },
+      React.createElement('a', { href: 'https://github.com/Fishsb/dsh-prompt-enhancer', target: '_blank', rel: 'noreferrer' }, t('cfgProjectLink')),
+    ),
+    error ? React.createElement('div', { className: 'dsh-plg-error', role: 'status' }, error) : null,
+    content,
+    logsOpen
+      ? React.createElement('div', { className: 'dsh-plg-logs' },
+          React.createElement('div', { className: 'dsh-plg-logs-head' },
+            React.createElement('span', { className: 'dsh-plg-label' }, t('cfgLogs')),
+            React.createElement('button', {
+              type: 'button',
+              className: 'dsh-plg-btn',
+              onClick: loadLogs,
+            }, t('pluginsRefresh')),
+          ),
+          logs === null || logs.length === 0
+            ? React.createElement('p', { className: 'dsh-plg-note' }, t('cfgLogsEmpty'))
+            : React.createElement('pre', { className: 'dsh-plg-logs-pre' }, logs.join('\n')),
+        )
+      : null,
+  );
+}
+
+// v16：可折叠区块（点击标题展开/收起，默认收起；行尾摘要 + 行首 chevron）

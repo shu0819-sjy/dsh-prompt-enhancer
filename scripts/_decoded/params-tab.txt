@@ -1,0 +1,254 @@
+function ParamsTab(props) {
+  const t = makeT(props);
+  // 2026-08-16（方案「设置界面样式与交互对齐官方」）：稳定 id——label htmlFor /
+  // aria-describedby 关联（useState 初始化只执行一次，重渲染不漂移）
+  const ids = React.useState(() => ({
+    mode: dshEnhId('dsh-enh-mode'),
+    modeHint: dshEnhId('dsh-enh-mode-hint'),
+    tpl: dshEnhId('dsh-enh-tpl'),
+    memory: dshEnhId('dsh-enh-memory'),
+    memoryHint: dshEnhId('dsh-enh-memory-hint'),
+    budget: dshEnhId('dsh-enh-budget'),
+    budgetHint: dshEnhId('dsh-enh-budget-hint'),
+    timeout: dshEnhId('dsh-enh-timeout'),
+    maxTokens: dshEnhId('dsh-enh-maxtokens'),
+    outputLimit: dshEnhId('dsh-enh-outputlimit'),
+    template: dshEnhId('dsh-enh-template'),
+    templateNote: dshEnhId('dsh-enh-template-note'),
+    templateName: dshEnhId('dsh-enh-template-name'),
+  }))[0];
+  const cfg = configState.value;
+  const save = (patch) => { saveConfig(patch); };
+  const onNumber = (key) => (e) => save({ params: { ...cfg.params, [key]: Number(e.target.value) } });
+  // v3.1.8（每模式档位）：取当前模式的超时/Token/字符档位表（publish 置灰但档位仍取同档，
+  // host 硬覆盖不设限）；显示值就近校正（旧配置值不在新档位时按不超过的最大档显示，不实际改配置）
+  const modeTimeoutOptions = MODE_TIMEOUT_OPTIONS[cfg.mode] || MODE_TIMEOUT_OPTIONS.base;
+  const modeMaxTokensOptions = MODE_MAXTOKENS_OPTIONS[cfg.mode] || MODE_MAXTOKENS_OPTIONS.base;
+  const modeOutputLimitOptions = MODE_OUTPUTLIMIT_OPTIONS[cfg.mode] || MODE_OUTPUTLIMIT_OPTIONS.base;
+  // v3.3.x（用户反馈）：当前模式的真实默认档（MODE_PARAMS_DEFAULT），供回退显示与提示行使用
+  const pDef = MODE_PARAMS_DEFAULT[cfg.mode] || MODE_PARAMS_DEFAULT.base;
+  const clampParamDisplay = (value, opts, modeDefault) => {
+    if (opts.includes(value)) return String(value);
+    // v3.3.x（用户反馈·修复）：未设置/越界时回退「当前模式默认档」，不再误显示首档（0=无限制）
+    if (modeDefault !== undefined && opts.includes(modeDefault)) return String(modeDefault);
+    const pick = opts.filter((v) => v <= value).pop();
+    return String(typeof pick === 'number' ? pick : opts[0]);
+  };
+  // v2.4.7（每模式独立自定义模板 + 默认预填）+ v2.5.3 修复：
+  // 切到「自定义模板」且当前优化模式无内容时 → host template/default 取该模式默认预填；
+  // 索引键 = cfg.mode（优化模式 base/lite/standard/smart），非 cfg.template.mode（模板模式 custom/builtin）——
+  // v2.5.2 及以前误用 template.mode 索引 texts/defaults（恒 undefined），预填与显示全部失效。
+  // 模板体系扩展（2026-08-18 修订）：每模式 2 个内置模板（default=默认模板·只清晰化重述 /
+  // increment=增量模板·保守补充未说的大逻辑/信息）+ 每模式多自定义模板——选中键 template.pick[mode]
+  // （default/increment/custom:<index>；旧 supplement/dev 键自动迁移为 increment）；
+  // 新建自定义模板时以当前选中模板文本预填（内置文本经 template/default RPC catalog 惰性拉取）。
+  const pickValue = (cfg.template.pick && cfg.template.pick[cfg.mode]) || 'default';
+  const customAll = (cfg.template.custom && typeof cfg.template.custom === 'object') ? cfg.template.custom : {};
+  const customList = Array.isArray(customAll[cfg.mode]) ? customAll[cfg.mode] : [];
+  const pickIdx = customPickIndex(pickValue);
+  const pickIsCustom = pickIdx >= 0 && pickIdx < customList.length;
+  const curEntry = pickIsCustom ? customList[pickIdx] : null;
+  const catalogRef = React.useRef(null);
+  const ensureCatalog = React.useCallback(() => {
+    if (catalogRef.current !== null) return Promise.resolve(catalogRef.current);
+    return host.call('template/default').then((res) => {
+      const r = res && typeof res === 'object' ? res : {};
+      catalogRef.current = (r.ok && r.catalog && typeof r.catalog === 'object') ? r.catalog : {};
+      return catalogRef.current;
+    }).catch(() => { catalogRef.current = {}; return catalogRef.current; });
+  }, []);
+  const onSelectTemplate = (v) => save({ template: { ...cfg.template, pick: { ...(cfg.template.pick || {}), [cfg.mode]: v } } });
+  const onAddCustom = () => {
+    if (customList.length >= TEMPLATE_CUSTOM_MAX) return;
+    ensureCatalog().then((cat) => {
+      let prefill = '';
+      if (curEntry) prefill = curEntry.text || '';
+      else if (cat && Array.isArray(cat[cfg.mode])) {
+        const bi = TEMPLATE_BUILTIN_KEYS.indexOf(pickValue);
+        prefill = cat[cfg.mode][bi >= 0 ? bi : 0] || '';
+      }
+      const entry = { name: '自定义模板 ' + (customList.length + 1), text: prefill.slice(0, TEMPLATE_TEXT_MAX) };
+      const newList = customList.concat(entry);
+      save({ template: { ...cfg.template, custom: { ...customAll, [cfg.mode]: newList }, pick: { ...(cfg.template.pick || {}), [cfg.mode]: 'custom:' + (newList.length - 1) } } });
+    });
+  };
+  const onEditCustom = (patch) => {
+    const newList = customList.map((c, k) => k === pickIdx ? { ...c, ...patch } : c);
+    save({ template: { ...cfg.template, custom: { ...customAll, [cfg.mode]: newList } } });
+  };
+  const onRemoveCustom = () => {
+    const newList = customList.filter((_, k) => k !== pickIdx);
+    let nextPick = 'default';
+    const cur = customPickIndex(pickValue);
+    if (cur !== -1 && cur !== pickIdx) nextPick = 'custom:' + (cur > pickIdx ? cur - 1 : cur);
+    save({ template: { ...cfg.template, custom: { ...customAll, [cfg.mode]: newList }, pick: { ...(cfg.template.pick || {}), [cfg.mode]: nextPick } } });
+  };
+  const curText = curEntry ? curEntry.text : '';
+  const curLabel = t('cfgTemplateTextFor').replace('{mode}', modeShortLabel(t, cfg.mode));
+  // v2.8.0 曾发布模式三项参数置灰（host 硬覆盖）；2026-08-18（用户指令）取消——publish 参数可调
+  // v2.8.2 曾一键发布记忆强制开启且不可关闭；2026-08-18（用户指令）取消——记忆跟随开关，publish 不例外
+  const memoryValue = cfg.memory;
+  return React.createElement(React.Fragment, null,
+    // v2.2（§6.6）：优化模式下拉（4 模式，记忆模式已删除）
+    // v2.4.6（布局）：优化模式与模板合并为同一行双字段（两控件均属「优化行为」配置、
+    // 宽度不大，并排省一行纵向空间；窄屏自动换行，见 .dsh-plg-field flex-wrap）
+    React.createElement('div', { className: 'dsh-plg-row dsh-plg-row-duo' },
+      React.createElement('div', { className: 'dsh-plg-field' },
+        React.createElement('label', { className: 'dsh-plg-label', htmlFor: ids.mode }, t('cfgMode')),
+        React.createElement(MarqueeSelect, {
+          id: ids.mode,
+          'aria-describedby': ids.modeHint,
+          className: 'dsh-plg-select',
+          value: cfg.mode,
+          onChange: (e) => {
+            const next = e.target.value;
+            // v3.1.8（实测驱动·用户指令）：切换模式 → **自动重置到该模式默认档位**（标准档）——
+            // params（超时/Token/字符）与 budgetChars 全部重置为该模式默认（MODE_PARAMS_DEFAULT /
+            // MODE_BUDGET_DEFAULT），替代上一版「就近校正」；用户切换后看到的就是该模式推荐默认。
+            const pd = MODE_PARAMS_DEFAULT[next] || MODE_PARAMS_DEFAULT.base;
+            const context = { ...(cfg.context || {}), budgetChars: (MODE_BUDGET_DEFAULT[next] !== undefined ? MODE_BUDGET_DEFAULT[next] : 0) };
+            const params = { ...(cfg.params || {}), timeoutMs: pd.timeoutMs, maxTokens: pd.maxTokens, outputLimit: pd.outputLimit };
+            // v2.8.2 曾切到一键发布时同步强制记忆开启；2026-08-18（用户指令）取消——记忆跟随开关
+            save({ mode: next, context, params });
+          },
+          // v3.1.7（用户反馈·设置页模式下拉不跟随语言）：选项文字改用 modeLabel(t) 翻译
+          // （modeLabel* i18n 键优先，MODE_OPTIONS.label 中文回退）——语言切换即时生效
+          children: MODE_OPTIONS.map((m) => React.createElement('option', { key: m.value, value: m.value }, modeLabel(t, m.value))),
+        }),
+      ),
+      React.createElement('div', { className: 'dsh-plg-field' },
+        React.createElement('label', { className: 'dsh-plg-label', htmlFor: ids.tpl }, t('cfgTemplateMode')),
+        React.createElement(MarqueeSelect, {
+          id: ids.tpl,
+          className: 'dsh-plg-select',
+          value: pickValue,
+          onChange: (e) => onSelectTemplate(e.target.value),
+          children: [
+            // 模板体系扩展（2026-08-17）：3 个内置模板（T1 默认模板保持现有行为不变）+ 该模式自定义模板列表
+            ...TEMPLATE_BUILTIN_KEYS.map((k) => React.createElement('option', { key: k, value: k }, t('tpl' + k.charAt(0).toUpperCase() + k.slice(1)))),
+            ...customList.map((c, i) => React.createElement('option', { key: 'custom:' + i, value: 'custom:' + i }, t('tplCustom').replace('{name}', c.name || ('自定义模板 ' + (i + 1))))),
+          ],
+        }),
+      ),
+    ),
+    React.createElement('p', { id: ids.modeHint, className: 'dsh-plg-hint' }, t('cfgModeHint' + cfg.mode.charAt(0).toUpperCase() + cfg.mode.slice(1))),
+    // v2.2（§6.2/§6.6）：记忆功能独立开关（所有模式可开/关，即时准确切换）
+    React.createElement('div', { className: 'dsh-plg-row' },
+      React.createElement('label', { className: 'dsh-plg-label', htmlFor: ids.memory }, t('cfgMemory')),
+      React.createElement(MarqueeSelect, {
+        id: ids.memory,
+        'aria-describedby': ids.memoryHint,
+        className: 'dsh-plg-select dsh-plg-select-thinking',
+        value: memoryValue ? 'on' : 'off',
+        onChange: (e) => { save({ memory: e.target.value === 'on' }); },
+        children: [
+          React.createElement('option', { key: 'on', value: 'on' }, t('cfgReasoningOn')),
+          React.createElement('option', { key: 'off', value: 'off' }, t('cfgReasoningOff')),
+        ],
+      }),
+    ),
+    React.createElement('p', { id: ids.memoryHint, className: 'dsh-plg-hint' }, t('cfgMemoryNote')),
+    // 预算下拉（全模式可见；0 = 不注入；档位随模式而异——MODE_BUDGET_OPTIONS 与 host 一致，
+    // 每模式最大档显示「无限制」；base 仅 0 档 = 关闭注入）
+    React.createElement('div', { className: 'dsh-plg-row' },
+      React.createElement('label', { className: 'dsh-plg-label', htmlFor: ids.budget }, t('cfgContextBudget')),
+      React.createElement(MarqueeSelect, {
+        id: ids.budget,
+        'aria-describedby': ids.budgetHint,
+        className: 'dsh-plg-select',
+        value: String(cfg.context.budgetChars),
+        onChange: (e) => save({ context: { ...cfg.context, budgetChars: Number(e.target.value) } }),
+        // v3.1.8（用户需求·预算真正生效 + 每模式独立档位）：按当前模式档位渲染；最大档显示「无限制」
+        children: (MODE_BUDGET_OPTIONS[cfg.mode] || MODE_BUDGET_OPTIONS.base).map((v, i, arr) =>
+          React.createElement('option', { key: String(v), value: String(v) },
+            v === 0 ? t('cfgContextBudget0') : (i === arr.length - 1 ? t('cfgUnlimited') : String(v)))),
+      }),
+    ),
+    React.createElement('p', { id: ids.budgetHint, className: 'dsh-plg-hint' }, t('cfgContextNote')),
+    // v3.1.8（每模式档位）：超时/Token/字符按当前模式档位渲染；2026-08-18（用户指令）取消 publish
+    // 硬覆盖置灰——publish 三项参数可调（默认档 60s/4k/16k 按实测覆盖）；smart 常带 effort host 自动 ≥120s
+    React.createElement('div', { className: 'dsh-plg-row' },
+      React.createElement('label', { className: 'dsh-plg-label', htmlFor: ids.timeout }, t('cfgTimeout')),
+      React.createElement(MarqueeSelect, {
+        id: ids.timeout,
+        className: 'dsh-plg-select',
+        value: clampParamDisplay(cfg.params.timeoutMs, modeTimeoutOptions, pDef.timeoutMs),
+        onChange: onNumber('timeoutMs'),
+        children: modeTimeoutOptions.map((v) => React.createElement('option', { key: v, value: String(v) }, v === 0 ? t('cfgUnlimited') : (v / 1000) + 's')),
+      }),
+    ),
+    React.createElement('div', { className: 'dsh-plg-row' },
+      React.createElement('label', { className: 'dsh-plg-label', htmlFor: ids.maxTokens }, t('cfgMaxTokens')),
+      React.createElement(MarqueeSelect, {
+        id: ids.maxTokens,
+        className: 'dsh-plg-select',
+        value: clampParamDisplay(cfg.params.maxTokens, modeMaxTokensOptions, pDef.maxTokens),
+        onChange: onNumber('maxTokens'),
+        children: modeMaxTokensOptions.map((v) => React.createElement('option', { key: v, value: String(v) }, v === 0 ? t('cfgUnlimited') : String(v))),
+      }),
+    ),
+    React.createElement('div', { className: 'dsh-plg-row' },
+      React.createElement('label', { className: 'dsh-plg-label', htmlFor: ids.outputLimit }, t('cfgOutputLimit')),
+      React.createElement(MarqueeSelect, {
+        id: ids.outputLimit,
+        className: 'dsh-plg-select',
+        value: clampParamDisplay(cfg.params.outputLimit, modeOutputLimitOptions, pDef.outputLimit),
+        onChange: onNumber('outputLimit'),
+        children: modeOutputLimitOptions.map((v) => React.createElement('option', { key: v, value: String(v) }, v === 0 ? t('cfgUnlimited') : String(v))),
+      }),
+    ),
+    // v3.3.x（用户反馈）：显式展示当前模式默认档——各模式默认一目了然
+    React.createElement('p', { className: 'dsh-plg-hint' },
+      t('cfgParamsModeDefault')
+        .replace('{t}', String(Math.round((Number(pDef.timeoutMs) || 0) / 1000)) + 's')
+        .replace('{k}', String(pDef.maxTokens))
+        .replace('{o}', String(pDef.outputLimit))),
+    // 模板体系扩展（2026-08-17）：模板选择已并入上方下拉（每模式独立）；下方为自定义模板编辑区
+    //（选中 custom:<index> 时显示 名称+内容+删除）+「新建自定义模板」按钮（可添加多个）
+    React.createElement('div', { className: 'dsh-plg-col' },
+      pickIsCustom && curEntry
+        ? React.createElement(React.Fragment, null,
+            React.createElement('div', { className: 'dsh-plg-row' },
+              React.createElement('label', { className: 'dsh-plg-label', htmlFor: ids.templateName }, t('tplName')),
+              React.createElement('input', {
+                id: ids.templateName,
+                className: 'dsh-plg-input',
+                type: 'text',
+                value: curEntry.name || '',
+                maxLength: TEMPLATE_NAME_MAX,
+                placeholder: t('tplNamePlaceholder'),
+                onChange: (e) => onEditCustom({ name: e.target.value.slice(0, TEMPLATE_NAME_MAX) }),
+              }),
+            ),
+            React.createElement('label', { className: 'dsh-plg-label', htmlFor: ids.template }, curLabel),
+            React.createElement('textarea', {
+              id: ids.template,
+              'aria-describedby': ids.templateNote,
+              className: 'dsh-plg-textarea',
+              value: curText,
+              rows: 12,
+              placeholder: t('cfgTemplateText'),
+              onChange: (e) => onEditCustom({ text: e.target.value.slice(0, TEMPLATE_TEXT_MAX) }),
+            }),
+            React.createElement('button', {
+              type: 'button',
+              className: 'dsh-plg-btn dsh-plg-btn-danger',
+              onClick: onRemoveCustom,
+              children: t('tplRemoveCustom'),
+            }),
+          )
+        : null,
+      React.createElement('button', {
+        type: 'button',
+        className: 'dsh-plg-btn',
+        disabled: customList.length >= TEMPLATE_CUSTOM_MAX,
+        onClick: onAddCustom,
+        children: t('tplAddCustom'),
+      }),
+      React.createElement('p', { id: ids.templateNote, className: 'dsh-plg-hint' }, t('tplNote')),
+    ),
+    React.createElement('p', { className: 'dsh-plg-hint' }, t('cfgHint')),
+  );
+}
+
+// v16：统一入口「模型与插件」——页内三区 tab（模型配置 / 优化参数 / 插件管理）

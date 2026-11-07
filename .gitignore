@@ -1,0 +1,57 @@
+# dsh-prompt-enhancer — Git 忽略规则（发布仓库）
+# 仅发布插件功能代码及必要文件；本文件只排除临时/系统产物。
+
+# ---- 本地私有沉淀（永不推送 GitHub）----
+.internal/
+# WorkBuddy 会话数据（本地记忆/工作日志，项目治理之外的本机沉淀）
+.workbuddy/
+# 圆桌会议工作目录（插件的本地状态/记录，与 .internal 同类，不入仓）
+.roundtable/
+
+# ---- 开发治理文档区（本地管理用，不推 GitHub；对外仅发布 package.json files 白名单内容）----
+# 开发治理/开发过程文档统一放 docs/internal/（架构方案/方案文档/贡献指南等）
+docs/internal/
+# 项目地图（本地管理用，不推 GitHub；治理工具契约路径，不可移动）
+docs/map/
+# agent 协作治理文档（本地管理用，不推 GitHub）
+AGENTS.md
+# 开发参考文档（本地管理用，不推 GitHub）
+docs/devref/
+
+# ---- 临时与系统文件 ----
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 编辑器/IDE ----
+.idea/
+.vscode/
+*.suo
+*.user
+
+# ---- 构建/依赖产物（本插件零依赖，预留） ----
+node_modules/
+dist/
+build/
+*.tgz
+# ---- 执行隔离与门禁运行产物（本地临时件，不入库）----
+# .dsh-worktrees/ = 任务看板的 worktree 执行隔离目录（含嵌套 git 仓库）
+#   不忽略的后果：git add -A 会把 8 个 worktree 当 gitlink 暂存（实测 8 条 embedded repo 警告）
+.dsh-worktrees/
+# gate.mjs 每次运行写的机读摘要（verdict / unjudged / 各环状态），临时件
+gate-summary.json
+
+# ---- 开发期临时探针/输出（_probe.cjs / _s.txt 一类，一次性脚本，不入发布仓）----
+_PATTERN_SCRATCH
+_*.cjs
+_*.txt
+_*.bak-*
+.bak/
+
+# 编辑残留备份（磁盘保留，不入库）
+*.bak
+*.bak-*

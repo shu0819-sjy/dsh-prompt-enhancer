@@ -1,0 +1,59 @@
+return {
+  inject: ['timer'],
+  apply(ctx) {
+    const slots = ctx.get('slots');
+    if (slots === undefined) return;
+    styles.insert(CSS);
+    timerSvc = ctx.get('timer') || null;
+    const locale = ctx.get('locale');
+    if (locale !== undefined && typeof locale.register === 'function') {
+      // v2.4.1-fix2（2026-08-14）：update 场景页面残留旧实例的 locale 命名空间
+      // （single occupant 硬约束抛 duplicate 导致 client-half-failed）——
+      // 字典未变时沿用旧注册即可：吞掉冲突、正常路径保留 disposer（卸载不误删他人）。
+      const safeRegister = (ns, lang, dict) => {
+        try {
+          return locale.register(ns, lang, dict);
+        } catch (e) {
+          return null;
+        }
+      };
+      ctx.effect(() => safeRegister('enhance', 'zh', ZH));
+      ctx.effect(() => safeRegister('enhance', 'en', EN));
+    }
+    dynFace = ctx.get('dynamicCordisRunner') || null;
+    // v16：整合「插件管理」+「优化配置」为单一入口「模型与插件」（页内三区 tab）
+    slots.inject('settings.section', () => slots.register(
+      {
+        name: 'settings.section',
+        id: 'model-plugins',
+        order: 25,
+        // 2026-08-18（用户需求）：导航 label 前加 ✨（与输入框优化按钮图标一致）
+        label: () => '✨ ' + (locale && typeof locale.bind === 'function' ? locale.bind('enhance')('navModelPlugins') : ZH.navModelPlugins),
+        locale: 'enhance',
+      },
+      ModelPluginsSection,
+    ));
+    // 注册幂等/唯一 id：本插件在 sidebar.footer.action 仅需占位（不渲染任何内容），
+    // id 改用插件语义唯一值 cordis-panel-enh，回避与基座 dsh-client-ui-cordis 的
+    // CordisPanel（id: 'cordis-panel'）冲突——同槽位同 id 触发 single-occupant duplicate，
+    // 导致 update/重挂时 "Failed to load plugins"。历史 v2.4.1-fix2 同类问题即由此来。
+    // （v2.4.5 曾无记录回退为 cordis-panel；v2.4.8 恢复本修复，见 CHANGELOG。）
+    slots.inject('sidebar.footer.action', () => slots.register(
+      { name: 'sidebar.footer.action', id: 'cordis-panel-enh', order: 0 },
+      CordisBadgePlaceholder,
+    ));
+    slots.inject('conversation.input.right', () => slots.register(
+      { name: 'conversation.input.right', id: 'prompt-enhance', order: 10, label: '提示词优化', locale: 'enhance' },
+      EnhanceButton,
+    ));
+    // v3.2.5（语音识别模块）：🎤 按钮独立注册同一槽位（order 11，紧邻优化按钮）——不侵入 EnhanceButton 既有代码（模块零交叉）
+    slots.inject('conversation.input.right', () => slots.register(
+      { name: 'conversation.input.right', id: 'voice-input', order: 11, label: '语音输入', locale: 'enhance' },
+      VoiceMicButton,
+    ));
+    slots.inject('conversation.input.dock', () => slots.register(
+      { name: 'conversation.input.dock', id: 'prompt-enhance-status', order: 30, label: '优化错误提示', locale: 'enhance' },
+      EnhanceBar,
+    ));
+  },
+};
