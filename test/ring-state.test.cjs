@@ -107,7 +107,7 @@ test('P5-04 「环换措辞」不误判：等义改写 + 契约行 => 三态由�
 
 test('P5-05 契约行缺失 => fail-closed（不接线不猜、不默认 PASS）', async () => {
   const { deriveState } = await lib();
-  const legacy = deriveState({ id: 'rpc', exitCode: 0, text: 'RPC 事实源一致：34 条线上方法' + NL + 'RING 式措辞但无契约：PASS' + NL });
+  const legacy = deriveState({ id: 'rpc', exitCode: 0, text: 'RPC 事实源一致：35 条线上方法' + NL + 'RING 式措辞但无契约：PASS' + NL });
   assert.equal(legacy.state, 'FAIL', '无契约行应 fail-closed');
   assert.equal(legacy.source, 'derived');
   const decoy = deriveState({ id: 'cards', exitCode: 0, text: 'RING-STATE cards SKIP 未判全' + NL + '由上文可知未判全，本条不是全过' + NL + 'RING-STATE-ISH PASS 假行' + NL });

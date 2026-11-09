@@ -61,7 +61,7 @@
 
 > 注：`update/executorEnsure` / `update/install` / `update/restartNeeded` 在 host RPC 清单中保留（部分版本由 client 直连执行器 3081），见 executor RPC；执行器自插件内重启能力退役后只负责**下载 / 校验 / 安装 / 回滚**，不再重启。
 
-> 注（**P2 · 2026-09-19 · 参数校验申报**）：上述 34 条中 **17 条有参数校验**（`lib/rpc-schema.cjs` 的 `schemas`），另 **17 条无校验且在此具名申报**——**禁止按类别笼统豁免**；新增线上方法却不申报、或申报过期，都会被 `node scripts/rpc-manifest.mjs --check` 拒绝（事实源由注册面派生，不靠人工清点）。
+> 注（**P2 · 2026-09-19 · 参数校验申报**）：上述 35 条中 **18 条有参数校验**（`lib/rpc-schema.cjs` 的 `schemas`），另 **17 条无校验且在此具名申报**——**禁止按类别笼统豁免**；新增线上方法却不申报、或申报过期，都会被 `node scripts/rpc-manifest.mjs --check` 拒绝（事实源由注册面派生，不靠人工清点）。
 >
 > | 方法 | 桶 | 理由 |
 > |---|---|---|

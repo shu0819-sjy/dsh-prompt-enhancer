@@ -54,7 +54,7 @@ function buildHost() {
 
   // Normalize line endings (see build-client.mjs): source files may carry CRLF
   // after a git checkout with core.autocrlf; committed artifacts are LF.
-  composed = composed.replace(/\r\n/g, '\n');
+  composed = composed.replace(/\r\n?/g, '\n');
 
   // v3.2.1-t（版本单一事实源）：占位符注入 package.json 版本（带引号字面量）。
   const pkgVersion = require('../package.json').version;

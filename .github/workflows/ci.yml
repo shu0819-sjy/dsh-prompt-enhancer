@@ -19,7 +19,10 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm install --ignore-scripts
+        # This plugin declares DSH peer packages that are supplied by the host
+        # runtime. npm's strict peer resolver cannot install that host-provided
+        # graph from a standalone clone, so use the legacy resolver here too.
+        run: npm install --ignore-scripts --legacy-peer-deps
 
       - name: Syntax check
         run: |

@@ -1165,6 +1165,7 @@ const MODE_BUDGET_OPTIONS = {
   standard: [0, 2000, 4000, 8000],
   smart: [0, 2000, 4000, 8000, 16000],
   publish: [0, 4000, 8000, 16000, 32000],
+
   diverge: [0, 2000, 4000, 8000, 16000],
 };
 // 每模式默认预算（base 0 = 无上下文检索；lite 2000 = 默认启用最近 1 轮会话参考（最小检索档，
@@ -1181,6 +1182,7 @@ const MODE_PARAMS_DEFAULT = {
   standard: { timeoutMs: 30000, maxTokens: 2000, outputLimit: 8000 },
   smart: { timeoutMs: 60000, maxTokens: 4000, outputLimit: 16000 },
   publish: { timeoutMs: 60000, maxTokens: 4000, outputLimit: 16000 }, // 2026-08-18 实测：默认模板 avg 44.3s max 51.1s / 输出 4348–8593 字符（host 硬覆盖不设限，此值仅结构默认/UI 语义）
+
   diverge: { timeoutMs: 60000, maxTokens: 4000, outputLimit: 16000 },
 };
 // 预算 → 扫描上限查表（仅 scanLimit:'by-budget' 模式消费；maxFiles = 注入 Top-N 上限）
@@ -1201,6 +1203,7 @@ const MODE_TABLE = {
   // v2.7.0（一键发布）：项目/游戏开发规格生成——完整检索（任务理解+工作区/会话）
   // + 网络检索（依据草稿与改动方向检索同类项目结构参考）+ 专用九章规格 system
   publish: { phaseA: 'llm', phaseB: 'file+event', phaseC: 'inject', budgetDefault: 4000, scanLimit: 'by-budget' },
+
   diverge: { phaseA: 'llm', phaseB: 'file+event', phaseC: 'inject', budgetDefault: 4000, scanLimit: 'by-budget' },
 };
 const MODE_KEYS = Object.keys(MODE_TABLE);

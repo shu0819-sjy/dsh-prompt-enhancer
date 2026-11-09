@@ -393,10 +393,10 @@ const CLAIMS = [
     adr: 'ADR-201', anchor: 'module:prompt-enhancer', at: '2026-09-12', level: '已兑现',
     promise: '收缩为「提示词增强 + 语音识别」双核心并移除插件内重启：删 update/portRestart、update/makeShortcut，新增 update/install（BREAKING）',
     assertions: [
-      A('A201-1', '结构', '线上注册面条数（与 test/rpc-contract.test.cjs 的数字锁交叉核）', '34 条', () => {
+      A('A201-1', '结构', '线上注册面条数（与 test/rpc-contract.test.cjs 的数字锁交叉核）', '35 条', () => {
         const { native, bundled } = liveMethods();
         const all = new Set([...native, ...bundled]);
-        return assert(all.size === 34, `${all.size} 条（原生 ${native.length} + bundle ${bundled.length}）`);
+        return assert(all.size === 35, `${all.size} 条（原生 ${native.length} + bundle ${bundled.length}）`);
       }),
       A('A201-2', '结构', '删两个 RPC / 新增 update/install', 'portRestart、makeShortcut 缺席；install 在位', () => {
         const { native, bundled } = liveMethods();
@@ -414,7 +414,7 @@ const CLAIMS = [
         const hits = walk('src/client').filter((f) => /portRestart|makeShortcut/.test(read(f)));
         return assert(!hits.length, hits.length ? `命中 ${hits.join(',')}` : '零引用');
       }),
-      witness('A201-5', 'test/rpc-contract.test.cjs', ['34', 'update/portRestart'], '数字契约锁与「已删方法永不返回」证据在册'),
+      witness('A201-5', 'test/rpc-contract.test.cjs', ['35', 'update/portRestart'], '数字契约锁与「已删方法永不返回」证据在册'),
     ],
   },
   {

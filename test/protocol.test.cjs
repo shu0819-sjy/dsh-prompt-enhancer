@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 // P1b（2026-09-19）：M3 骨架 src/host/protocol.js 已退役 → 其守卫 PROTO-01 随骨架一并退役
-//（该表声明 21 条而线上实为 34 条，本就不构成事实源；源头治理见 P2）。
+//（该表声明 21 条而线上实为 35 条，本就不构成事实源；源头治理见 P2）。
 // rpc-schema 的活副本是 lib/rpc-schema.cjs（原 src/host/rpc-schema.js 为死层，已删）→ 守卫改挂活副本。
 const { validateRpcArgs } = require('../lib/rpc-schema.cjs');
 
