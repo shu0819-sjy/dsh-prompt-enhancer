@@ -150,6 +150,31 @@ test('判定流超时会清理挂起迭代器并及时返回', async () => {
   assert.equal(returned, true, 'timeout requests iterator cleanup');
 });
 
+test('判定流清理本身挂起时仍及时返回超时', async () => {
+  const handlers = require(path.join(root, 'src/host/enhance-handlers.js'));
+  const start = handlers.indexOf('    async function collectStreamWithTimeout');
+  const end = handlers.indexOf('    async function summarizeSessionContext', start);
+  const helper = handlers.slice(start, end);
+  let timerCallback;
+  const timeoutHelper = await new Function('ctx', 'collectStream',
+    'return (async function(){' + helper + '; return collectStreamWithTimeout;})()')(
+      { timer: { timeout(fn) { timerCallback = fn; return () => {}; } } },
+      async () => new Promise(() => {}),
+    );
+  const iterator = {
+    next() { return new Promise(() => {}); },
+    return() { return new Promise(() => {}); },
+  };
+  const pending = timeoutHelper(iterator, 1200, 5);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  timerCallback();
+  const result = await Promise.race([
+    pending,
+    new Promise((resolve) => setTimeout(() => resolve({ kind: 'hung' }), 50)),
+  ]);
+  assert.equal(result.kind, 'timeout');
+});
+
 test('context telemetry is wired from host result to client store and enhance button tooltip', () => {
   const host = fs.readFileSync(path.join(root, 'plugin-host.js'), 'utf8');
   assert.match(host, /state\.telemetry\s*=\s*\{\s*summary:\s*summaryText/);

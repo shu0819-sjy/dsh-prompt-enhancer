@@ -4018,7 +4018,7 @@ return {
       try {
         const result = await Promise.race([collectStream(iterator, outputLimit), timeoutResult]);
         if (result.kind === 'timeout' && iterator && typeof iterator.return === 'function') {
-          try { await iterator.return(); } catch (e) { /* 忽略清理失败 */ }
+          Promise.resolve(iterator.return()).catch(() => {})
         }
         return result;
       } finally {
