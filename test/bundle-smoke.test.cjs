@@ -725,9 +725,9 @@ test('SMK-17 progress exposes fine-grained detail during publish (v3.0r)', async
 
 // ---- v3.1.3 看门狗 + 延迟连通性预检（base 模式直通 llm，无检索干扰） ----
 const REAL_TIMER = { timeout: (cb, ms) => { const id = setTimeout(cb, ms); return () => clearTimeout(id); } };
-const WATCHDOG_WAIT = 15600; // 参考值（当前未消费）：略大于 bundle 内 WATCHDOG_TIMEOUT_MS=15000（v3.3.3）
+const WATCHDOG_WAIT = 45600; // 参考值（当前未消费）：略大于 bundle 内 WATCHDOG_TIMEOUT_MS=45000
 
-// SMK-17：首条生成流静默挂起（看门狗 3s 触发）→ 探测剩余链 → 第二条可达 → 用第二条生成成功
+// SMK-17：首条生成流静默挂起（看门狗 45s 触发）→ 探测剩余链 → 第二条可达 → 用第二条生成成功
 test('SMK-17 watchdog: silent head → probe next → fallback generation (fallbackUsed)', async () => {
   const seen = [];
   const { handlers } = boot({
@@ -741,7 +741,7 @@ test('SMK-17 watchdog: silent head → probe next → fallback generation (fallb
     config: {
       mode: 'base',
       fallback: [{ provider: 'p', model: 'm-a' }, { provider: 'p', model: 'm-b' }],
-      params: { maxTokens: 2000, timeoutMs: 30000 },
+      params: { maxTokens: 2000, timeoutMs: 60000 },
     },
   });
   assert.equal(out.ok, true);
@@ -771,15 +771,14 @@ test('SMK-18 watchdog: all probes fail → ALL_MODELS_UNAVAILABLE fast', async (
     config: {
       mode: 'base',
       fallback: [{ provider: 'p', model: 'm-a' }, { provider: 'p', model: 'm-b' }],
-      params: { maxTokens: 2000, timeoutMs: 30000 },
+      params: { maxTokens: 2000, timeoutMs: 60000 },
     },
   });
   const elapsed = Date.now() - t0;
   assert.equal(out.ok, false);
   assert.equal(out.code, 'ALL_MODELS_UNAVAILABLE');
-  // v3.3.3（常量放大适配）：WATCHDOG_TIMEOUT_MS 5000→15000——挂起首条需等满看门狗窗口
-  // 才进入探测（探测本身毫秒级返回 QUOTA 失败），故窗口从 <15s 放宽到 <25s（30s 总超时内）
-  assert.ok(elapsed < 25000, '看门狗窗口内报错（远小于 30s 总超时），实际 ' + elapsed + 'ms');
+  // v3.4.4：慢首字模型允许 45s，探测失败后应在总请求边界内收束。
+  assert.ok(elapsed < 70000, '总请求 timeout 内报错，实际 ' + elapsed + 'ms');
   // 探测了两条（m-b 失败后回头探 m-a）
   const probe = seen.filter((p) => String(p.system || '').includes('connectivity probe'));
   assert.ok(probe.length >= 2, '至少探测 m-b 与回头探 m-a');

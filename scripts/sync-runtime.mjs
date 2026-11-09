@@ -46,7 +46,14 @@ function runtimeDirs() {
 }
 
 function md5(p) {
-  return createHash('md5').update(readFileSync(p)).digest('hex');
+  const data = readFileSync(p);
+  // 同步阶段会剥离文本产物 BOM；校验时按部署后的规范化字节比较，避免
+  // 源文件带 BOM 而目标文件已安全去 BOM 时产生假失败。
+  const normalized = TEXT_DEPLOY_EXT.test(p) && data.length >= 3 &&
+    data[0] === 0xef && data[1] === 0xbb && data[2] === 0xbf
+    ? data.subarray(3)
+    : data;
+  return createHash('md5').update(normalized).digest('hex');
 }
 
 // v4.9（2026-08-23 事故根治）：部署文本文件自动剥离 UTF-8 BOM——仓库清单若带 BOM，

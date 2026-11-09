@@ -1226,7 +1226,7 @@ const V2_ROUNDS_SCAN_MAX = 10;
 // 旧值 5s 看门狗 + 3s 探测会把「慢但健康」模型误判不可达并冻结 30s（增强直调
 // llm.stream 无宿主 retryPolicy(always) 兜底）——本组放宽对齐实测；
 // 探测失败缓存缩至 5s 免整链冻僵。
-const WATCHDOG_TIMEOUT_MS = 15000;
+const WATCHDOG_TIMEOUT_MS = 45000;
 const PROBE_TIMEOUT_MS = 12000;
 const PROBE_CACHE_TTL_MS = 5000;
 // 2026-08-18（用户需求）：会话历史显式内容提取上限 1200 → 2400（覆盖长回复/表格，避免截断显式内容）
