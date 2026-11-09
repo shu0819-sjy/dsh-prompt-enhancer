@@ -1,6 +1,8 @@
 # dsh-prompt-enhancer
 
-A DeepSeek Harness (DSH) plugin with **two core capabilities**:
+This project is a continuously improved plugin built on top of the open-source [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) project. It uses the upstream plugin runtime and capabilities while continuing to improve prompt enhancement, conversation context handling, and voice input based on real-world usage.
+
+It provides **two core capabilities**:
 
 - ✨ **Prompt enhancement** — rewrite composer drafts in place with one click, fully undoable
 - 💬 **Voice recognition** — speech-to-text that stops on silence, with cloud / local dual engines; the transcript is filled into the draft
@@ -16,7 +18,7 @@ A DeepSeek Harness (DSH) plugin with **two core capabilities**:
 The ✨ button in the composer toolbar triggers an independent LLM call and rewrites the current draft in place; keep refining, undo anytime, or cancel while enhancing.
 
 - **One-click enhance** — the ✨ button triggers an independent LLM call and replaces the draft; continue refining, undo anytime, cancel while enhancing
-- **5 optimization modes** — Basic (direct) / Lite (previous-round context) / Standard (rules + retrieval) / Expert (task analysis + full retrieval) / One-click Publish (complete dev-spec generator)
+- **6 optimization modes** — Basic (direct) / Lite (previous-round context) / Standard (rules + retrieval) / Expert (task analysis + full retrieval) / One-click Publish (complete dev-spec generator) / Diverge (context-aware direction expansion)
 - **Memory switch** — when on, pre-send rounds (optimize → edit → re-optimize) accumulate into a memory chain the next round replays and senses your edit direction; sending the message clears it; when off, nothing is read or written
 - **Model chain** — try multiple models in order, reorder, toggle thinking, run inline connectivity tests
 
