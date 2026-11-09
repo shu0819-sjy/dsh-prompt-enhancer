@@ -69,9 +69,11 @@ jobs:
       # 2026-09-19 第一次修复（--test-force-exit + --test-timeout）实测**不足**：run 35391559294 仍在
       # 12 分钟步级硬顶处被杀，且结束时残留 4 个 node 孤儿进程 → 挂起发生在测试**进程内**，
       # 不是「跑完不退出」，force-exit 帮不上；test-timeout 也打断不了阻塞中的用例。
-      # 故改为**按文件隔离跑**：每个测试文件独立进程 + 60s 硬顶，挂死只影响它自己，
+      # 故改为**按文件隔离跑**：每个测试文件独立进程 + 120s 硬顶，挂死只影响它自己，
       # 其余文件照常给结论（这同时就是「12 件零上报文件」的逐件裁定手段）。
       # P4 尾修（2026-09-19）：硬顶 40→60s（bundle-smoke 有 ~30s 退出尾巴），并新增「源码注册数 ≥ runner 上报数」
+      # 2026-11-10：bundle-smoke 新增第二个 45s 看门狗回归场景，单文件总耗时约 90s，
+      # 故将隔离硬顶提高到 120s；仍远低于步骤级 12min 上限。
       # 不变量——把「用例静默消失而 CI 报绿」这一类假绿变成红色失败（详见下方 run 步骤内注释）。
       - name: Run tests (per-file isolation · 60s cap each · 注册数不变量)
         if: always()
@@ -84,7 +86,7 @@ jobs:
           for f in $files; do
             n=$(basename "$f" .test.cjs)
             t0=$(date +%s)
-            if timeout -s KILL 60 node --test "$f" >"test-reports/$n.log" 2>&1; then
+            if timeout -s KILL 120 node --test "$f" >"test-reports/$n.log" 2>&1; then
               # P4 尾修（2026-09-19·CI 实测驱动）：此处**不得**再加 --test-force-exit。
               # run 35400375036 的探针实证：test/lib.test.cjs 在 ubuntu 上「已读到文件尾且注册 82 个顶层 test」，
               # 但挂该旗标时 runner 只上报 52/53 条（两次运行数值还不一样）⇒ 29 条用例随子进程提前退出而静默消失，
