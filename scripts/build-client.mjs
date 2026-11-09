@@ -27,6 +27,7 @@ function buildClient() {
   const updaterChunk = require('../src/client/updater.js');
   const stateChunk = require('../src/client/state.js');
   const helpersChunk = require('../src/client/helpers.js');
+  const nextSuggestionChunk = require('../src/client/next-suggestion.js');
   const modelHelpersChunk = require('../src/client/model-helpers.js');
   const enhanceButtonChunk = require('../src/client/components/enhance-button.js');
   const enhanceBarChunk = require('../src/client/components/enhance-bar.js');
@@ -58,6 +59,7 @@ function buildClient() {
     ['// @dsh-client-updater-inject', updaterChunk],
     ['// @dsh-client-state-inject', stateChunk],
     ['// @dsh-client-helpers-inject', helpersChunk],
+    ['// @dsh-client-next-suggestion-inject', nextSuggestionChunk],
     ['// @dsh-client-model-helpers-inject', modelHelpersChunk],
     ['// @dsh-client-comp-enhance-button-inject\n', enhanceButtonChunk],
     ['// @dsh-client-comp-enhance-bar-inject\n', enhanceBarChunk],

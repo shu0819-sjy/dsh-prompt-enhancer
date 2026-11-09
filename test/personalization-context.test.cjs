@@ -120,3 +120,46 @@ test('summary helper uses selected model with draft and history, and fails close
   assert.equal(returnedIterator, true, 'timeout requests iterator cleanup');
   void timeoutCallback;
 });
+
+test('判定流超时会清理挂起迭代器并及时返回', async () => {
+  const handlers = require(path.join(root, 'src/host/enhance-handlers.js'));
+  const start = handlers.indexOf('    async function collectStreamWithTimeout');
+  const end = handlers.indexOf('    async function summarizeSessionContext', start);
+  assert.ok(start >= 0 && end > start, 'timeout helper boundaries found');
+  const helper = handlers.slice(start, end);
+  let returned = false;
+  let timerCallback;
+  const timeoutHelper = await new Function('ctx', 'collectStream',
+    'return (async function(){' + helper + '; return collectStreamWithTimeout;})()')(
+      { timer: { timeout(fn) { timerCallback = fn; return () => {}; } } },
+      async (iterator) => {
+        await iterator.next();
+        return { kind: 'ok', text: '' };
+      },
+    );
+  const iterator = {
+    next() { return new Promise(() => {}); },
+    return() { returned = true; return Promise.resolve({ done: true }); },
+  };
+  const pending = timeoutHelper(iterator, 1200, 5);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(typeof timerCallback, 'function');
+  timerCallback();
+  const result = await pending;
+  assert.equal(result.kind, 'timeout');
+  assert.equal(returned, true, 'timeout requests iterator cleanup');
+});
+
+test('context telemetry is wired from host result to client store and enhance button tooltip', () => {
+  const host = fs.readFileSync(path.join(root, 'plugin-host.js'), 'utf8');
+  assert.match(host, /state\.telemetry\s*=\s*\{\s*summary:\s*summaryText/);
+  assert.match(host, /summaryChars:\s*summaryText\.length/);
+  assert.match(host, /budgetChars:\s*rbudget\.roundsChars/);
+  assert.match(host, /injectedChars:\s*state\.v2Block\.length/);
+  assert.match(host, /telemetry:\s*state\.telemetry/);
+
+  const client = fs.readFileSync(path.join(root, 'lib/client.cjs'), 'utf8');
+  assert.match(client, /telemetry:\s*null/);
+  assert.match(client, /s\.telemetry\s*=\s*r\.telemetry/);
+  assert.match(client, /【上下文总览摘要】/);
+});

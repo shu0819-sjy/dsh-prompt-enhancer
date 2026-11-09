@@ -31,6 +31,7 @@
 | `models/stats` | client → host | 模型实测统计（扫会话投影聚合 TTFT / tokens-per-second，附 base/lite 预估秒数） | 只读 |
 | `models/autochain` | client → host | 自适应链 | 只读 |
 | `template/default` | client → host | 默认模板 | 只读 |
+| `suggestion/next` | client → host | 下一步建议 | 只读 |
 | `update/check` | client → host | 版本检测（local 运行时读运行环境 package.json） | 只读 |
 | `update/pull` | client → host | 拉取清单文件 | 用户触发 |
 | `update/envcheck` | client → host | 环境检测 | 只读 |

@@ -344,9 +344,9 @@ test('U1 validateConfig mode/context 解析', () => {
   assert.equal(bad.memory, false);
 });
 
-test('U19 MODE_TABLE 完整性 + parseMode 迁移（v2.7.0 五模式）', () => {
-  // 表完整性：5 模式齐全（记忆模式已删除；v2.7.0 加 publish 一键发布）、字段合法、budget 属白名单
-  assert.deepEqual(Object.keys(MODE_TABLE).sort(), ['base', 'lite', 'publish', 'smart', 'standard']);
+test('U19 MODE_TABLE 完整性 + parseMode 迁移（v3.4.3 六模式）', () => {
+  // 表完整性：6 模式齐全（记忆模式已删除；v2.7.0 加 publish；v3.4.3 加 diverge 发散）、字段合法、budget 属白名单
+  assert.deepEqual(Object.keys(MODE_TABLE).sort(), ['base', 'diverge', 'lite', 'publish', 'smart', 'standard']);
   for (const [k, row] of Object.entries(MODE_TABLE)) {
     assert.ok(['none', 'rule', 'llm'].includes(row.phaseA), k + ' phaseA');
     assert.ok(['none', 'file+event'].includes(row.phaseB), k + ' phaseB');
@@ -369,8 +369,10 @@ test('U19 MODE_TABLE 完整性 + parseMode 迁移（v2.7.0 五模式）', () => 
   assert.equal(parseBudgetChars(undefined, 'standard'), 4000);
   assert.equal(parseBudgetChars(undefined, 'base'), 0, 'base 默认 0（无检索）');
   assert.equal(parseBudgetChars(32000, 'publish'), 32000, 'publish 最大档 32000');
+  assert.equal(parseBudgetChars(4000, 'diverge'), 4000, 'diverge 默认 4000');
+  assert.equal(parseBudgetChars(32000, 'diverge'), 4000, 'diverge 无 32000 档 → 回退 diverge 默认 4000');
   // 每模式档位表：全模式齐全、档位单调递增、均在全局候选池内
-  assert.deepEqual(Object.keys(MODE_BUDGET_OPTIONS).sort(), ['base', 'lite', 'publish', 'smart', 'standard']);
+  assert.deepEqual(Object.keys(MODE_BUDGET_OPTIONS).sort(), ['base', 'diverge', 'lite', 'publish', 'smart', 'standard']);
   for (const [k, opts] of Object.entries(MODE_BUDGET_OPTIONS)) {
     assert.ok(Array.isArray(opts) && opts.length > 0, k + ' 档位非空');
     assert.ok(opts.every((v) => BUDGET_OPTIONS.includes(v)), k + ' 档位在候选池');

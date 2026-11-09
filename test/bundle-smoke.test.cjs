@@ -339,17 +339,21 @@ test('SMK-08 lite window hit injects session reference', async () => {
   const mainText = calls[1].messages[0].content[0].text;
   assert.ok(mainText.includes('【相关会话参考（仅吸收明确需求，禁止复述）】'), 'main call receives session reference');
   assert.ok(mainText.includes('再优化一下'), 'reference contains window text');
+  assert.equal(out.telemetry.summaryChars, out.telemetry.summary.length);
+  assert.equal(out.telemetry.budgetChars, 1200);
+  assert.ok(out.telemetry.injectedChars <= out.telemetry.budgetChars, 'context block stays within rounds budget');
 });
 
-test('SMK-08b continuation skips retrieve and uses delta as main direction', async () => {
+test('SMK-08b continuation retrieves session context and keeps delta as main direction', async () => {
   const seen = [];
-  const { handlers } = boot({ llm: mockLlm(seen) });
+  const { handlers } = boot({ llm: mockLlmSmart(seen, { related: true }), sessionQuery: mockSessionQuery() });
   const out = await handlers.get('enhance')({
     sessionId: 's',
     seq: 7,
     text: '旧优化结果 新增加要求',
     config: {
-      mode: 'lite',
+      mode: 'diverge',
+      context: { budgetChars: 4000 },
       memory: true,
       fallback: [{ provider: 'p', model: 'm' }],
       params: { maxTokens: 2000, timeoutMs: 30000 },
@@ -357,12 +361,15 @@ test('SMK-08b continuation skips retrieve and uses delta as main direction', asy
     memory: { rounds: [{ input: '旧需求', output: '旧优化结果' }] },
   });
   assert.equal(out.ok, true);
-  assert.equal(seen.length, 1, 'continuation should only call main LLM, no judge/retrieval');
-  assert.ok(seen[0].system.includes('继续优化模式'), 'system should include CONTINUE_PROMPT');
-  const messages = seen[0].messages;
-  const finalText = messages[messages.length - 1].content[0].text;
+  const calls = withoutSummary(seen);
+  assert.equal(calls.length, 2, 'continuation should retrieve related session context before the main call');
+  assert.ok(calls[0].system.includes('会话关联性判定器'), 'first call should judge session relevance');
+  assert.ok(calls.some((call) => call.system.includes('继续优化模式')), 'main call should include CONTINUE_PROMPT');
+  const messages = calls[1].messages;
+  const finalText = messages.map((message) => (message.content || []).map((part) => part.text || '').join('\n')).join('\n');
   assert.ok(finalText.includes('【本轮修改】（主要优化方向）'), 'finalText should lead with delta direction');
   assert.ok(finalText.includes('旧优化结果'), 'current draft should be included');
+  assert.ok(finalText.includes('【相关会话参考（仅吸收明确需求，禁止复述）】'), 'retrieved session context should reach the main call');
 });
 
 

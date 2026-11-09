@@ -1,6 +1,6 @@
 {
   "name": "dsh-prompt-enhancer",
-  "version": "3.4.2",
+  "version": "3.4.3",
   "description": "DeepSeek Harness (DSH) plugin: one-click prompt enhancement (✨) and voice recognition (💬, cloud/local dual engines) for the composer",
   "license": "MIT",
   "main": "lib/index.cjs",
@@ -24,7 +24,7 @@
     "verify:enhance": "node scripts/enhance-verify.mjs",
     "build:client": "node scripts/build-client.mjs",
     "build": "node scripts/build-host.mjs && node scripts/build-client.mjs",
-    "test": "node --test test/personalization-context.test.cjs test/client-enhance-flow.test.cjs test/lib.test.cjs test/sys.test.cjs test/maintain.test.cjs test/updater-host.test.cjs test/update-gate.test.cjs test/deploy-guard.test.cjs test/protocol.test.cjs test/observability.test.cjs test/bundle-smoke.test.cjs test/config-persist.test.cjs test/voice-persist.test.cjs test/asr-cloud-contract.test.cjs test/platform-service.test.cjs test/rpc-guard.test.cjs test/rpc-contract.test.cjs test/gate-shell-decl-consistency.cjs test/gate-chain-attribution.test.cjs test/gate-exit.test.cjs test/ring-state.test.cjs test/asr-worker-linux.test.cjs test/asr-worker-reap.test.cjs test/asr-worker-reap-win32.test.cjs test/e2e-personalization-audit.test.cjs"
+    "test": "node --test test/next-suggestion.test.cjs test/personalization-context.test.cjs test/client-enhance-flow.test.cjs test/lib.test.cjs test/sys.test.cjs test/maintain.test.cjs test/updater-host.test.cjs test/update-gate.test.cjs test/deploy-guard.test.cjs test/protocol.test.cjs test/observability.test.cjs test/bundle-smoke.test.cjs test/config-persist.test.cjs test/voice-persist.test.cjs test/asr-cloud-contract.test.cjs test/platform-service.test.cjs test/rpc-guard.test.cjs test/rpc-contract.test.cjs test/gate-shell-decl-consistency.cjs test/gate-chain-attribution.test.cjs test/gate-exit.test.cjs test/ring-state.test.cjs test/asr-worker-linux.test.cjs test/asr-worker-reap.test.cjs test/asr-worker-reap-win32.test.cjs test/e2e-personalization-audit.test.cjs"
   },
   "dsh": {
     "bundle": {
@@ -32,13 +32,19 @@
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-locale"
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-conversation"
       ],
       "platform": "web"
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-client-locale": ">=0.1.0-rc.6"
+    "@deepseek-ai/dsh-client-locale": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "^0.2.0-rc.2"
   },
   "keywords": [
     "deepseek-harness",
